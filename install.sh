@@ -22,7 +22,6 @@ warn()    { printf "%s%s[WARN]%s %s\n"   "$YELLOW" "$BOLD" "$RESET" "$*"; }
 success() { printf "%s%s[OK]%s   %s\n"   "$GREEN" "$BOLD" "$RESET" "$*"; }
 error()   { printf "%s%s[ERR]%s  %s\n"   "$RED"   "$BOLD" "$RESET" "$*"; }
 
-# ---------- Main ----------
 mkdir -p "$BIN_DIR" "$LIB_DIR"
 
 tmp="$(mktemp -d)"
@@ -50,12 +49,21 @@ cp -f "$REPO_DIR/bin/csw" "$BIN_DIR/csw"
 
 chmod +x "$LIB_DIR/ccswitch.sh" "$BIN_DIR/csw"
 
+# ---- Read installed version from the installed script ----
+installed_version="$(
+  awk -F'"' '/^[[:space:]]*readonly[[:space:]]+CSW_VERSION=/{print $2; exit}' "$LIB_DIR/ccswitch.sh" 2>/dev/null || true
+)"
+if [[ -z "${installed_version:-}" ]]; then
+  installed_version="unknown"
+fi
+
 success "Installed: $BIN_DIR/csw"
 success "Library:   $LIB_DIR/ccswitch.sh"
+success "Version:   ${installed_version}"
 
 echo
 warn "If 'csw' is not found, add to PATH:"
-printf "  %sexport PATH=\"%s:\$PATH\"%s\n" "$BOLD" "$BIN_DIR" "$RESET"
+printf "  %sexport PATH=\"\$HOME/.local/bin:\$PATH\"%s\n" "$BOLD" "$RESET"
 echo
 info "zsh:"
-printf "  echo 'export PATH=\"%s:\$PATH\"' >> ~/.zshrc && source ~/.zshrc\n" "$BIN_DIR"
+printf "  echo 'export PATH=\"\$HOME/.local/bin:\$PATH\"' >> ~/.zshrc && source ~/.zshrc\n"

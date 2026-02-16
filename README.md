@@ -72,6 +72,10 @@ csw --remove-account user2@example.com
 
 # Help
 csw --help
+
+# Updater
+csw --v
+csw --check-update
 ```
 
 ---
