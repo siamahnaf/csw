@@ -3,7 +3,7 @@
 
 set -euo pipefail
 
-readonly CSW_VERSION="1.0.7"
+readonly CSW_VERSION="1.0.8"
 
 # Repo info (used for update checks)
 readonly CSW_REPO="siamahnaf/csw"
@@ -856,40 +856,49 @@ main() {
   check_dependencies
 
   case "${1:-}" in
-    -v|--version)
-      echo "csw version ${CSW_VERSION}"
-      ;;
-    --check-update)
-      cmd_check_update
-      ;;
-    --update)
-      cmd_update
-      ;;
-    --add-account)
-      cmd_add_account
-      ;;
-    --remove-account)
-      shift
-      cmd_remove_account "$@"
-      ;;
-    --list)
-      cmd_list
-      ;;
-    --switch)
-      cmd_switch
-      ;;
-    --switch-to)
-      shift
-      cmd_switch_to "$@"
-      ;;
-    --help|"")
-      show_usage
-      ;;
-    *)
-      echo "Error: Unknown command '$1'"
-      show_usage
-      exit 1
-      ;;
+  -v|--version|version)
+    echo "csw version ${CSW_VERSION}"
+    ;;
+
+  -check-update|--check-update|check-update)
+    cmd_check_update
+    ;;
+
+  --update|update)
+    cmd_update
+    ;;
+
+  --add-account|add-account)
+    cmd_add_account
+    ;;
+
+  --remove-account|remove-account|rm-account)
+    shift
+    cmd_remove_account "$@"
+    ;;
+
+  --list|list|ls)
+    cmd_list
+    ;;
+
+  --switch|switch|next)
+    cmd_switch
+    ;;
+
+  --switch-to|switch-to|to)
+    shift
+    cmd_switch_to "$@"
+    ;;
+
+  --help|help|-h|"")
+    show_usage
+    ;;
+
+  *)
+    echo "Error: Unknown command '$1'"
+    show_usage
+    exit 1
+    ;;
   esac
 }
 
