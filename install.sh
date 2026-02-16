@@ -4,7 +4,7 @@ set -euo pipefail
 PREFIX="${PREFIX:-$HOME/.local}"
 BIN_DIR="$PREFIX/bin"
 LIB_DIR="$PREFIX/share/csw"
-REPO_TARBALL="https://github.com/<YOUR_GITHUB_USERNAME>/<YOUR_REPO_NAME>/archive/refs/heads/main.tar.gz"
+REPO_TARBALL="https://github.com/siamahnaf/csw/archive/refs/heads/main.tar.gz"
 
 mkdir -p "$BIN_DIR" "$LIB_DIR"
 
