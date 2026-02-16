@@ -3,7 +3,7 @@
 
 set -euo pipefail
 
-readonly CSW_VERSION="1.0.3"
+readonly CSW_VERSION="1.0.4"
 
 # Repo info (used for update checks)
 readonly CSW_REPO="siamahnaf/csw"

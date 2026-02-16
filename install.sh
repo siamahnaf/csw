@@ -55,7 +55,7 @@ success "Library:   $LIB_DIR/ccswitch.sh"
 
 echo
 warn "If 'csw' is not found, add to PATH:"
-printf "  %sexport PATH=\"%s:\\$PATH\"%s\n" "$BOLD" "$BIN_DIR" "$RESET"
+printf "  %sexport PATH=\"%s:\$PATH\"%s\n" "$BOLD" "$BIN_DIR" "$RESET"
 echo
 info "zsh:"
-printf "  echo 'export PATH=\"%s:\\$PATH\"' >> ~/.zshrc && source ~/.zshrc\n" "$BIN_DIR"
+printf "  echo 'export PATH=\"%s:\$PATH\"' >> ~/.zshrc && source ~/.zshrc\n" "$BIN_DIR"
