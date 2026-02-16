@@ -1,4 +1,10 @@
-# csw — Multi-Account Switcher for Claude Code
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="https://raw.githubusercontent.com/siamahnaf/assets-kit/main/logo/logo-white.png">
+  <source media="(prefers-color-scheme: light)" srcset="https://raw.githubusercontent.com/siamahnaf/assets-kit/main/logo/logo-black.png">
+  <img alt="Siam Ahnaf" src="https://raw.githubusercontent.com/siamahnaf/assets-kit/main/logo/logo-black.png" height="auto" width="240">
+</picture>
+
+# Multi-Account Switcher for Claude Code
 
 `csw` is a lightweight CLI to **manage and switch between multiple Claude Code accounts** on **macOS, Linux, and WSL**.
 
@@ -54,28 +60,28 @@ hash -r
 
 ```bash
 # Add the currently logged-in Claude Code account to managed accounts
-csw --add-account
+csw add-account
 
 # List all managed accounts
-csw --list
+csw list
 
 # Switch to the next account in your rotation
-csw --switch
+csw switch
 
 # Switch to a specific account by number or email
-csw --switch-to 2
-csw --switch-to user2@example.com
+csw switch-to 2
+csw switch-to user2@example.com
 
 # Remove an account (by number or email)
-csw --remove-account 2
-csw --remove-account user2@example.com
+csw remove-account 2
+csw remove-account user2@example.com
 
 # Help
-csw --help
+csw -help
 
 # Updater
-csw --v
-csw --check-update
+csw -v
+csw -check-update
 ```
 
 ---
@@ -86,18 +92,18 @@ csw --check-update
 2. Run:
 
    ```bash
-   csw --add-account
+   csw add-account
    ```
 3. **Log out**, then log in with your second account
 4. Run again:
 
    ```bash
-   csw --add-account
+   csw add-account
    ```
 5. Switch accounts anytime:
 
    ```bash
-   csw --switch
+   csw switch
    ```
 
 After switching, **restart Claude Code** to apply the new authentication.
@@ -112,125 +118,14 @@ After switching, **restart Claude Code** to apply the new authentication.
 * **Bash 3.2+** (works with the default macOS Bash)
 * **jq** (JSON processor)
 
-### Check requirements
 
-```bash
-bash --version
-jq --version
-```
-
-### Install `jq`
-
-**macOS (Homebrew):**
-
-```bash
-brew install jq
-```
-
-**Ubuntu/Debian:**
-
-```bash
-sudo apt-get update && sudo apt-get install -y jq
-```
-
-**Arch:**
-
-```bash
-sudo pacman -Sy jq
-```
-
----
-
-## How it works
-
-`csw` stores per-account authentication data under:
-
-* `~/.claude-switch-backup/`
-
-Storage details:
-
-* **macOS**
-
-  * credentials: **Keychain**
-  * config backups: `~/.claude-switch-backup/`
-* **Linux/WSL**
-
-  * credentials + config backups: `~/.claude-switch-backup/` (permissions restricted)
-
-When you switch accounts, it:
-
-1. Backs up the current account’s auth data
-2. Restores the target account’s auth data
-3. Updates Claude Code authentication files locally
-
----
-
-## Troubleshooting
-
-### `csw: command not found`
-
-Make sure `~/.local/bin` is in PATH (see Installation section), then restart your terminal or run:
-
-```bash
-hash -r
-```
-
-### Can’t add an account
-
-* Make sure you are **logged in** to Claude Code first
-* Verify `jq` exists:
-
-  ```bash
-  jq --version
-  ```
-* Ensure the Claude config exists:
-
-  ```bash
-  ls -la ~/.claude.json ~/.claude/.claude.json 2>/dev/null
-  ```
-
-### Claude Code doesn’t reflect the switched account
-
-* **Restart Claude Code** after switching
-* Confirm active account:
-
-  ```bash
-  csw --list
-  ```
-
----
-
-## Uninstall / cleanup
-
-### Remove the CLI
-
-If you used the installer:
-
-```bash
-curl -fsSL https://raw.githubusercontent.com/siamahnaf/csw/main/uninstall.sh | bash
-```
-
-### Remove all saved account backups
-
-```bash
-rm -rf ~/.claude-switch-backup
-```
-
-Your current Claude Code login remains active.
-
----
-
-## Security notes
-
-* Credentials are stored locally:
-
-  * macOS: Keychain
-  * Linux/WSL: files with restrictive permissions
-* `csw` does not send data to any remote server
-* For safest switching, close Claude Code during account switches
-
----
-
-## License
-
-MIT License — see `LICENSE`.
+## Connect with me
+<div style="display: flex; align-items: center; gap: 3px;">
+<a href="https://wa.me/8801611994403"><img src="https://raw.githubusercontent.com/siamahnaf/assets-kit/main/icons/whatsapp.png" width="40" height="40"></a>
+<a href="https://siamahnaf.com/" style="margin-right: 8px"><img src="https://raw.githubusercontent.com/siamahnaf/assets-kit/main/icons/web.png" width="40" height="40"></a>
+<a href="https://www.linkedin.com/in/siamahnaf/" style="margin-right: 8px"><img src="https://raw.githubusercontent.com/siamahnaf/assets-kit/main/icons/linkedin.png" width="40" height="40"></a>
+<a href="https://x.com/siamahnaf198" style="margin-right: 8px"><img src="https://raw.githubusercontent.com/siamahnaf/assets-kit/main/icons/x.png" width="40" height="40"></a>
+<a href="https://www.facebook.com/siamahnaf198/" style="margin-right: 8px"><img src="https://raw.githubusercontent.com/siamahnaf/assets-kit/main/icons/facebook.png" width="40" height="40"></a>
+<a href="https://t.me/siamahnaf198" style="margin-right: 8px"><img src="https://raw.githubusercontent.com/siamahnaf/assets-kit/main/icons/telegram.png" width="40" height="40"></a>
+<a href="https://www.npmjs.com/~siamahnaf" style="margin-right: 8px"><img src="https://raw.githubusercontent.com/siamahnaf/assets-kit/main/icons/npm.png" width="40" height="40"></a>
+</div>
