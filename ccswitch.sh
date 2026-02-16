@@ -1,9 +1,13 @@
 #!/usr/bin/env bash
-
-# Multi-Account Switcher for Claude Code
-# Bash 3.2 compatible (macOS default)
+# csw — Multi-Account Switcher for Claude Code (Bash 3.2 compatible)
 
 set -euo pipefail
+
+readonly CSW_VERSION="1.0.0"
+
+# Repo info (used for update checks)
+readonly CSW_REPO="siamahnaf/csw"
+readonly CSW_DEFAULT_BRANCH="main"
 
 # Configuration
 readonly BACKUP_DIR="$HOME/.claude-switch-backup"
@@ -103,11 +107,9 @@ write_json() {
   chmod 600 "$file"
 }
 
-# Resolve account identifier:
-# - if numeric -> return it
-# - else treat as email and find account number
 resolve_account_identifier() {
   local identifier="$1"
+
   if [[ "$identifier" =~ ^[0-9]+$ ]]; then
     echo "$identifier"
     return 0
@@ -127,11 +129,151 @@ resolve_account_identifier() {
 # Dependencies
 # -----------------------------
 check_dependencies() {
-  if ! command -v jq >/dev/null 2>&1; then
-    echo "Error: Required command 'jq' not found."
-    echo "On macOS install via Homebrew: brew install jq"
-    exit 1
+  for cmd in jq curl; do
+    if ! command -v "$cmd" >/dev/null 2>&1; then
+      echo "Error: Required command '$cmd' not found."
+      if [[ "$cmd" == "jq" ]]; then
+        echo "macOS: brew install jq"
+        echo "Ubuntu/Debian: sudo apt-get install -y jq"
+      fi
+      exit 1
+    fi
+  done
+}
+
+# -----------------------------
+# Update helpers
+# -----------------------------
+_strip_v_prefix() {
+  # strips leading 'v' from tags like v1.2.3
+  echo "${1#v}"
+}
+
+# returns 0 if A > B, else 1
+_semver_gt() {
+  local a="$(_strip_v_prefix "$1")"
+  local b="$(_strip_v_prefix "$2")"
+
+  awk -v a="$a" -v b="$b" '
+    function n(x){ return (x==""?0:x)+0 }
+    BEGIN{
+      split(a,A,"."); split(b,B,".")
+      for(i=1;i<=3;i++){
+        ai=n(A[i]); bi=n(B[i])
+        if(ai>bi) exit 0
+        if(ai<bi) exit 1
+      }
+      exit 1
+    }
+  '
+}
+
+_get_latest_release_tag() {
+  # Uses GitHub Releases API; returns "" if none
+  # NOTE: unauthenticated GitHub API has rate limits
+  curl -fsSL "https://api.github.com/repos/${CSW_REPO}/releases/latest" 2>/dev/null \
+    | jq -r '.tag_name // empty' 2>/dev/null \
+    | head -n 1
+}
+
+_check_update_available() {
+  local tag latest
+  tag="$(_get_latest_release_tag)"
+  if [[ -z "${tag:-}" ]]; then
+    # No releases found; cannot compare versions reliably
+    return 2
   fi
+  latest="$(_strip_v_prefix "$tag")"
+
+  if _semver_gt "$latest" "$CSW_VERSION"; then
+    echo "$latest"
+    return 0
+  fi
+
+  return 1
+}
+
+cmd_check_update() {
+  local latest
+  if latest="$(_check_update_available)"; then
+    echo "Update available: ${CSW_VERSION} -> ${latest}"
+    echo "Run: csw --update"
+    return 0
+  fi
+
+  case "$?" in
+    1)
+      echo "You are up to date: ${CSW_VERSION}"
+      return 0
+      ;;
+    2)
+      echo "No GitHub releases found for ${CSW_REPO}."
+      echo "Tip: create a release tag like v${CSW_VERSION} to enable update checking."
+      echo "You can still update from branch '${CSW_DEFAULT_BRANCH}' using: csw --update"
+      return 0
+      ;;
+    *)
+      echo "Could not check for updates (network/API issue)."
+      return 1
+      ;;
+  esac
+}
+
+_install_from_tarball() {
+  local tarball_url="$1"
+  local prefix="${PREFIX:-$HOME/.local}"
+  local bin_dir="${prefix}/bin"
+  local lib_dir="${prefix}/share/csw"
+
+  mkdir -p "$bin_dir" "$lib_dir"
+
+  local tmp repo_dir
+  tmp="$(mktemp -d)"
+  # shellcheck disable=SC2064
+  trap "rm -rf \"$tmp\"" EXIT
+
+  curl -fsSL "$tarball_url" -o "$tmp/repo.tar.gz"
+  tar -xzf "$tmp/repo.tar.gz" -C "$tmp"
+
+  # For tag tarballs: repo folder name is usually csw-<tag>
+  repo_dir="$(find "$tmp" -maxdepth 1 -type d -name 'csw-*' | head -n 1)"
+  if [[ -z "${repo_dir:-}" || ! -d "$repo_dir" ]]; then
+    echo "Error: Could not locate extracted repo folder."
+    return 1
+  fi
+
+  cp -f "$repo_dir/ccswitch.sh" "$lib_dir/ccswitch.sh"
+  cp -f "$repo_dir/bin/csw" "$bin_dir/csw"
+
+  chmod +x "$lib_dir/ccswitch.sh" "$bin_dir/csw"
+
+  echo "✅ Installed/updated: $bin_dir/csw"
+  echo "✅ Library: $lib_dir/ccswitch.sh"
+  return 0
+}
+
+cmd_update() {
+  # Prefer updating to latest GitHub Release if available; otherwise update from main branch.
+  local tag latest tarball
+
+  tag="$(_get_latest_release_tag)"
+  if [[ -n "${tag:-}" ]]; then
+    latest="$(_strip_v_prefix "$tag")"
+    if _semver_gt "$latest" "$CSW_VERSION"; then
+      echo "Updating to release ${tag}..."
+    else
+      echo "Already up to date (${CSW_VERSION}). Reinstalling latest release ${tag}..."
+    fi
+    tarball="https://codeload.github.com/${CSW_REPO}/tar.gz/${tag}"
+    _install_from_tarball "$tarball"
+    echo "Done."
+    return 0
+  fi
+
+  echo "No GitHub releases found. Updating from branch '${CSW_DEFAULT_BRANCH}'..."
+  tarball="https://codeload.github.com/${CSW_REPO}/tar.gz/refs/heads/${CSW_DEFAULT_BRANCH}"
+  _install_from_tarball "$tarball"
+  echo "Done."
 }
 
 # -----------------------------
@@ -217,7 +359,6 @@ write_credentials() {
 
   case "$platform" in
     macos)
-      # Store as generic password; -U updates if exists
       security add-generic-password -U -s "Claude Code-credentials" -a "$USER" -w "$credentials" 2>/dev/null
       ;;
     linux|wsl)
@@ -517,9 +658,7 @@ cmd_list() {
   ' "$SEQUENCE_FILE"
 }
 
-# Compute next account using jq (no bash arrays)
 get_next_in_sequence() {
-  # Requires SEQUENCE_FILE to exist
   jq -r '
     (.sequence // []) as $s
     | if ($s|length) == 0 then empty
@@ -555,8 +694,6 @@ cmd_switch() {
     echo "Please run '$0 --switch' again to switch to the next account."
     exit 0
   fi
-
-  # wait_for_claude_close
 
   local next_account
   next_account="$(get_next_in_sequence)"
@@ -603,11 +740,9 @@ cmd_switch_to() {
     exit 1
   fi
 
-  # wait_for_claude_close
   perform_switch "$target_account"
 }
 
-# Determine current managed account number from current email
 get_current_managed_account_num() {
   local email="$1"
   if [[ "$email" == "none" || ! -f "$SEQUENCE_FILE" ]]; then
@@ -636,11 +771,9 @@ perform_switch() {
   local current_account
   current_account="$(get_current_managed_account_num "$current_email")"
   if [[ -z "$current_account" ]]; then
-    # fallback to activeAccountNumber (might be null)
     current_account="$(jq -r '.activeAccountNumber // empty' "$SEQUENCE_FILE")"
   fi
 
-  # Step 1: Backup current account (only if we can resolve it)
   local cfg_path
   cfg_path="$(get_claude_config_path)"
 
@@ -653,7 +786,6 @@ perform_switch() {
     write_account_config "$current_account" "$current_email" "$current_config"
   fi
 
-  # Step 2: Retrieve target account backup
   local target_creds target_config
   target_creds="$(read_account_credentials "$target_account" "$target_email")"
   target_config="$(read_account_config "$target_account" "$target_email")"
@@ -663,7 +795,6 @@ perform_switch() {
     exit 1
   fi
 
-  # Step 3: Activate target creds
   write_credentials "$target_creds"
 
   local oauth_section
@@ -682,7 +813,6 @@ perform_switch() {
 
   write_json "$cfg_path" "$merged_config"
 
-  # Step 4: Update state
   local now
   now="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 
@@ -702,7 +832,7 @@ perform_switch() {
 }
 
 show_usage() {
-  echo "Multi-Account Switcher for Claude Code"
+  echo "csw — Multi-Account Switcher for Claude Code"
   echo "Usage: $0 [COMMAND]"
   echo ""
   echo "Commands:"
@@ -711,15 +841,10 @@ show_usage() {
   echo "  --list                           List all managed accounts"
   echo "  --switch                         Rotate to next account in sequence"
   echo "  --switch-to <num|email>          Switch to specific account number or email"
+  echo "  --check-update                   Check for updates"
+  echo "  --update                         Update csw to the latest version"
+  echo "  -v, --version                    Show csw version"
   echo "  --help                           Show this help message"
-  echo ""
-  echo "Examples:"
-  echo "  $0 --add-account"
-  echo "  $0 --list"
-  echo "  $0 --switch"
-  echo "  $0 --switch-to 2"
-  echo "  $0 --switch-to user@example.com"
-  echo "  $0 --remove-account user@example.com"
 }
 
 main() {
@@ -731,6 +856,15 @@ main() {
   check_dependencies
 
   case "${1:-}" in
+    -v|--version)
+      echo "csw version ${CSW_VERSION}"
+      ;;
+    --check-update)
+      cmd_check_update
+      ;;
+    --update)
+      cmd_update
+      ;;
     --add-account)
       cmd_add_account
       ;;
