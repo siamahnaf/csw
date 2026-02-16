@@ -1,5 +1,14 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-SELF_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
-exec "$SELF_DIR/../ccswitch.sh" "$@"
+PREFIX="${PREFIX:-$HOME/.local}"
+LIB="$PREFIX/share/csw/ccswitch.sh"
+
+if [[ ! -f "$LIB" ]]; then
+  echo "Error: csw is installed but missing: $LIB"
+  echo "Reinstall with:"
+  echo "  curl -fsSL https://raw.githubusercontent.com/siamahnaf/csw/main/install.sh | bash"
+  exit 1
+fi
+
+exec /bin/bash "$LIB" "$@"
