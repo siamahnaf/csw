@@ -3,7 +3,7 @@
 
 set -euo pipefail
 
-readonly CSW_VERSION="1.2.0"
+readonly CSW_VERSION="1.3.0"
 
 # Repo info (used for update checks)
 readonly CSW_REPO="siamahnaf/csw"
@@ -12,6 +12,27 @@ readonly CSW_DEFAULT_BRANCH="main"
 # Configuration
 readonly BACKUP_DIR="$HOME/.claude-switch-backup"
 readonly SEQUENCE_FILE="$BACKUP_DIR/sequence.json"
+
+# -----------------------------
+# Colors / Styled output
+# -----------------------------
+RED="$(printf '\033[31m')"
+GREEN="$(printf '\033[32m')"
+YELLOW="$(printf '\033[33m')"
+BLUE="$(printf '\033[34m')"
+MAGENTA="$(printf '\033[35m')"
+CYAN="$(printf '\033[36m')"
+BOLD="$(printf '\033[1m')"
+DIM="$(printf '\033[2m')"
+RESET="$(printf '\033[0m')"
+
+info()    { printf "%s%s[INFO]%s %s\n" "$BLUE"   "$BOLD" "$RESET" "$*"; }
+warn()    { printf "%s%s[WARN]%s %s\n" "$YELLOW" "$BOLD" "$RESET" "$*"; }
+success() { printf "%s%s[OK]%s   %s\n" "$GREEN"  "$BOLD" "$RESET" "$*"; }
+error()   { printf "%s%s[ERR]%s  %s\n" "$RED"    "$BOLD" "$RESET" "$*"; }
+step()    { printf "%s%s==>%s %s\n"     "$CYAN"   "$BOLD" "$RESET" "$*"; }
+title()   { printf "%s%s%s%s\n"         "$MAGENTA" "$BOLD" "$*" "$RESET"; }
+dimln()   { printf "%s%s%s\n"           "$DIM" "$*" "$RESET"; }
 
 # -----------------------------
 # Container detection
@@ -76,7 +97,7 @@ get_claude_config_path() {
 validate_json() {
   local file="$1"
   if ! jq . "$file" >/dev/null 2>&1; then
-    echo "Error: Invalid JSON in $file"
+    error "Invalid JSON in $file"
     return 1
   fi
 }
@@ -99,7 +120,7 @@ write_json() {
 
   if ! jq . "$temp_file" >/dev/null 2>&1; then
     rm -f "$temp_file"
-    echo "Error: Generated invalid JSON"
+    error "Generated invalid JSON"
     return 1
   fi
 
@@ -131,10 +152,10 @@ resolve_account_identifier() {
 check_dependencies() {
   for cmd in jq curl; do
     if ! command -v "$cmd" >/dev/null 2>&1; then
-      echo "Error: Required command '$cmd' not found."
+      error "Required command '$cmd' not found."
       if [[ "$cmd" == "jq" ]]; then
-        echo "macOS: brew install jq"
-        echo "Ubuntu/Debian: sudo apt-get install -y jq"
+        dimln "  macOS: brew install jq"
+        dimln "  Ubuntu/Debian: sudo apt-get install -y jq"
       fi
       exit 1
     fi
@@ -196,24 +217,24 @@ _check_update_available() {
 cmd_check_update() {
   local latest
   if latest="$(_check_update_available)"; then
-    echo "Update available: ${CSW_VERSION} -> ${latest}"
-    echo "Run: csw --update"
+    warn "Update available: ${CSW_VERSION} -> ${latest}"
+    info "Run: csw --update"
     return 0
   fi
 
   case "$?" in
     1)
-      echo "You are up to date: ${CSW_VERSION}"
+      success "You are up to date: ${CSW_VERSION}"
       return 0
       ;;
     2)
-      echo "No GitHub releases found for ${CSW_REPO}."
-      echo "Tip: create a release tag like v${CSW_VERSION} to enable update checking."
-      echo "You can still update from branch '${CSW_DEFAULT_BRANCH}' using: csw --update"
+      warn "No GitHub releases found for ${CSW_REPO}."
+      info "Tip: create a release tag like v${CSW_VERSION} to enable update checking."
+      info "You can still update from branch '${CSW_DEFAULT_BRANCH}' using: csw --update"
       return 0
       ;;
     *)
-      echo "Could not check for updates (network/API issue)."
+      error "Could not check for updates (network/API issue)."
       return 1
       ;;
   esac
@@ -238,7 +259,7 @@ _install_from_tarball() {
   # For tag tarballs: repo folder name is usually csw-<tag>
   repo_dir="$(find "$tmp" -maxdepth 1 -type d -name 'csw-*' | head -n 1)"
   if [[ -z "${repo_dir:-}" || ! -d "$repo_dir" ]]; then
-    echo "Error: Could not locate extracted repo folder."
+    error "Could not locate extracted repo folder."
     return 1
   fi
 
@@ -247,8 +268,8 @@ _install_from_tarball() {
 
   chmod +x "$lib_dir/ccswitch.sh" "$bin_dir/csw"
 
-  echo "✅ Installed/updated: $bin_dir/csw"
-  echo "✅ Library: $lib_dir/ccswitch.sh"
+  success "Installed/updated: $bin_dir/csw"
+  info "Library: $lib_dir/ccswitch.sh"
   return 0
 }
 
@@ -260,20 +281,20 @@ cmd_update() {
   if [[ -n "${tag:-}" ]]; then
     latest="$(_strip_v_prefix "$tag")"
     if _semver_gt "$latest" "$CSW_VERSION"; then
-      echo "Updating to release ${tag}..."
+      step "Updating to release ${tag}..."
     else
-      echo "Already up to date (${CSW_VERSION}). Reinstalling latest release ${tag}..."
+      step "Already up to date (${CSW_VERSION}). Reinstalling latest release ${tag}..."
     fi
     tarball="https://codeload.github.com/${CSW_REPO}/tar.gz/${tag}"
     _install_from_tarball "$tarball"
-    echo "Done."
+    success "Done."
     return 0
   fi
 
-  echo "No GitHub releases found. Updating from branch '${CSW_DEFAULT_BRANCH}'..."
+  warn "No GitHub releases found. Updating from branch '${CSW_DEFAULT_BRANCH}'..."
   tarball="https://codeload.github.com/${CSW_REPO}/tar.gz/refs/heads/${CSW_DEFAULT_BRANCH}"
   _install_from_tarball "$tarball"
-  echo "Done."
+  success "Done."
 }
 
 # -----------------------------
@@ -296,14 +317,14 @@ wait_for_claude_close() {
     return 0
   fi
 
-  echo "Claude Code is running. Please close it first."
-  echo "Waiting for Claude Code to close..."
+  warn "Claude Code is running. Please close it first."
+  info "Waiting for Claude Code to close..."
 
   while is_claude_running; do
     sleep 1
   done
 
-  echo "Claude Code closed. Continuing..."
+  success "Claude Code closed. Continuing..."
 }
 
 # -----------------------------
@@ -482,12 +503,12 @@ cmd_add_account() {
   current_email="$(get_current_account)"
 
   if [[ "$current_email" == "none" ]]; then
-    echo "Error: No active Claude account found. Please log in first."
+    error "No active Claude account found. Please log in first."
     exit 1
   fi
 
   if account_exists "$current_email"; then
-    echo "Account $current_email is already managed."
+    warn "Account $current_email is already managed."
     exit 0
   fi
 
@@ -502,7 +523,7 @@ cmd_add_account() {
   current_config="$(cat "$cfg_path")"
 
   if [[ -z "$current_creds" ]]; then
-    echo "Error: No credentials found for current account"
+    error "No credentials found for current account"
     exit 1
   fi
 
@@ -527,17 +548,17 @@ cmd_add_account() {
   ' "$SEQUENCE_FILE")"
 
   write_json "$SEQUENCE_FILE" "$updated"
-  echo "Added Account $account_num: $current_email"
+  success "Added Account $account_num: $current_email"
 }
 
 cmd_remove_account() {
   if [[ $# -eq 0 ]]; then
-    echo "Usage: $0 --remove-account <account_number|email>"
+    error "Usage: $0 --remove-account <account_number|email>"
     exit 1
   fi
 
   if [[ ! -f "$SEQUENCE_FILE" ]]; then
-    echo "Error: No accounts are managed yet"
+    error "No accounts are managed yet"
     exit 1
   fi
 
@@ -548,12 +569,12 @@ cmd_remove_account() {
     account_num="$identifier"
   else
     if ! validate_email "$identifier"; then
-      echo "Error: Invalid email format: $identifier"
+      error "Invalid email format: $identifier"
       exit 1
     fi
     account_num="$(resolve_account_identifier "$identifier")"
     if [[ -z "$account_num" ]]; then
-      echo "Error: No account found with email: $identifier"
+      error "No account found with email: $identifier"
       exit 1
     fi
   fi
@@ -561,7 +582,7 @@ cmd_remove_account() {
   local account_info
   account_info="$(jq -r --arg num "$account_num" '.accounts[$num] // empty' "$SEQUENCE_FILE")"
   if [[ -z "$account_info" ]]; then
-    echo "Error: Account-$account_num does not exist"
+    error "Account-$account_num does not exist"
     exit 1
   fi
 
@@ -571,14 +592,15 @@ cmd_remove_account() {
   local active_account
   active_account="$(jq -r '.activeAccountNumber' "$SEQUENCE_FILE")"
   if [[ "$active_account" == "$account_num" ]]; then
-    echo "Warning: Account-$account_num ($email) is currently active"
+    warn "Account-$account_num ($email) is currently active"
   fi
 
-  echo -n "Are you sure you want to permanently remove Account-$account_num ($email)? [y/N] "
+  printf "%s%sAre you sure you want to permanently remove Account-%s (%s)?%s [y/N] " \
+    "$YELLOW" "$BOLD" "$account_num" "$email" "$RESET"
   local confirm
   read -r confirm
   if [[ "$confirm" != "y" && "$confirm" != "Y" ]]; then
-    echo "Cancelled"
+    warn "Cancelled"
     exit 0
   fi
 
@@ -606,22 +628,23 @@ cmd_remove_account() {
   ' "$SEQUENCE_FILE")"
 
   write_json "$SEQUENCE_FILE" "$updated"
-  echo "Account-$account_num ($email) has been removed"
+  success "Account-$account_num ($email) has been removed"
 }
 
 first_run_setup() {
   local current_email
   current_email="$(get_current_account)"
   if [[ "$current_email" == "none" ]]; then
-    echo "No active Claude account found. Please log in first."
+    error "No active Claude account found. Please log in first."
     return 1
   fi
 
-  echo -n "No managed accounts found. Add current account ($current_email) to managed list? [Y/n] "
+  printf "%s%sNo managed accounts found.%s Add current account (%s) to managed list? [Y/n] %s" \
+    "$CYAN" "$BOLD" "$RESET" "$current_email" "$RESET"
   local response
   read -r response
   if [[ "$response" == "n" || "$response" == "N" ]]; then
-    echo "Setup cancelled. You can run '$0 --add-account' later."
+    warn "Setup cancelled. You can run '$0 --add-account' later."
     return 1
   fi
 
@@ -631,7 +654,7 @@ first_run_setup() {
 
 cmd_list() {
   if [[ ! -f "$SEQUENCE_FILE" ]]; then
-    echo "No accounts are managed yet."
+    warn "No accounts are managed yet."
     first_run_setup || true
     exit 0
   fi
@@ -646,7 +669,7 @@ cmd_list() {
     ' "$SEQUENCE_FILE" 2>/dev/null | head -n 1)"
   fi
 
-  echo "Accounts:"
+  title "Accounts:"
   jq -r --arg active "$active_account_num" '
     .sequence[]? as $num
     | .accounts[($num|tostring)]
@@ -674,31 +697,32 @@ get_next_in_sequence() {
 
 cmd_switch() {
   if [[ ! -f "$SEQUENCE_FILE" ]]; then
-    echo "Error: No accounts are managed yet"
+    error "No accounts are managed yet"
     exit 1
   fi
 
   local current_email
   current_email="$(get_current_account)"
   if [[ "$current_email" == "none" ]]; then
-    echo "Error: No active Claude account found"
+    error "No active Claude account found"
     exit 1
   fi
 
   if ! account_exists "$current_email"; then
-    echo "Notice: Active account '$current_email' was not managed."
+    warn "Active account '$current_email' was not managed."
+    info "Adding it automatically..."
     cmd_add_account
     local account_num
     account_num="$(jq -r '.activeAccountNumber' "$SEQUENCE_FILE")"
-    echo "It has been automatically added as Account-$account_num."
-    echo "Please run '$0 --switch' again to switch to the next account."
+    success "Added as Account-$account_num."
+    info "Please run '$0 --switch' again to switch to the next account."
     exit 0
   fi
 
   local next_account
   next_account="$(get_next_in_sequence)"
   if [[ -z "$next_account" ]]; then
-    echo "Error: No accounts in sequence."
+    error "No accounts in sequence."
     exit 1
   fi
 
@@ -707,12 +731,12 @@ cmd_switch() {
 
 cmd_switch_to() {
   if [[ $# -eq 0 ]]; then
-    echo "Usage: $0 --switch-to <account_number|email>"
+    error "Usage: $0 --switch-to <account_number|email>"
     exit 1
   fi
 
   if [[ ! -f "$SEQUENCE_FILE" ]]; then
-    echo "Error: No accounts are managed yet"
+    error "No accounts are managed yet"
     exit 1
   fi
 
@@ -723,12 +747,12 @@ cmd_switch_to() {
     target_account="$identifier"
   else
     if ! validate_email "$identifier"; then
-      echo "Error: Invalid email format: $identifier"
+      error "Invalid email format: $identifier"
       exit 1
     fi
     target_account="$(resolve_account_identifier "$identifier")"
     if [[ -z "$target_account" ]]; then
-      echo "Error: No account found with email: $identifier"
+      error "No account found with email: $identifier"
       exit 1
     fi
   fi
@@ -736,7 +760,7 @@ cmd_switch_to() {
   local account_info
   account_info="$(jq -r --arg num "$target_account" '.accounts[$num] // empty' "$SEQUENCE_FILE")"
   if [[ -z "$account_info" ]]; then
-    echo "Error: Account-$target_account does not exist"
+    error "Account-$target_account does not exist"
     exit 1
   fi
 
@@ -761,7 +785,7 @@ perform_switch() {
   local target_email
   target_email="$(jq -r --arg num "$target_account" '.accounts[$num].email // empty' "$SEQUENCE_FILE")"
   if [[ -z "$target_email" ]]; then
-    echo "Error: Could not resolve target account email."
+    error "Could not resolve target account email."
     exit 1
   fi
 
@@ -782,8 +806,10 @@ perform_switch() {
   current_config="$(cat "$cfg_path")"
 
   if [[ -n "$current_account" && "$current_account" != "null" && "$current_email" != "none" ]]; then
+    step "Saving current account backup..."
     write_account_credentials "$current_account" "$current_email" "$current_creds"
     write_account_config "$current_account" "$current_email" "$current_config"
+    success "Backed up: Account-$current_account ($current_email)"
   fi
 
   local target_creds target_config
@@ -791,23 +817,24 @@ perform_switch() {
   target_config="$(read_account_config "$target_account" "$target_email")"
 
   if [[ -z "$target_creds" || -z "$target_config" ]]; then
-    echo "Error: Missing backup data for Account-$target_account"
+    error "Missing backup data for Account-$target_account"
     exit 1
   fi
 
+  step "Applying target credentials/config..."
   write_credentials "$target_creds"
 
   local oauth_section
   oauth_section="$(printf '%s' "$target_config" | jq '.oauthAccount' 2>/dev/null || true)"
   if [[ -z "$oauth_section" || "$oauth_section" == "null" ]]; then
-    echo "Error: Invalid oauthAccount in backup"
+    error "Invalid oauthAccount in backup"
     exit 1
   fi
 
   local merged_config
   merged_config="$(jq --argjson oauth "$oauth_section" '.oauthAccount = $oauth' "$cfg_path" 2>/dev/null)"
   if [[ $? -ne 0 || -z "$merged_config" ]]; then
-    echo "Error: Failed to merge config"
+    error "Failed to merge config"
     exit 1
   fi
 
@@ -824,32 +851,32 @@ perform_switch() {
 
   write_json "$SEQUENCE_FILE" "$updated"
 
-  echo "Switched to Account-$target_account ($target_email)"
+  success "Switched to Account-$target_account ($target_email)"
   cmd_list
   echo ""
-  echo "Please restart Claude Code to use the new authentication."
+  warn "Please restart Claude Code to use the new authentication."
   echo ""
 }
 
 show_usage() {
-  echo "csw — Multi-Account Switcher for Claude Code"
-  echo "Usage: $0 [COMMAND]"
+  title "csw — Multi-Account Switcher for Claude Code"
+  dimln "Usage: $0 [COMMAND]"
   echo ""
-  echo "Commands:"
-  echo "  --add-account                    Add current account to managed accounts"
-  echo "  --remove-account <num|email>    Remove account by number or email"
-  echo "  --list                           List all managed accounts"
-  echo "  --switch                         Rotate to next account in sequence"
-  echo "  --switch-to <num|email>          Switch to specific account number or email"
-  echo "  --check-update                   Check for updates"
-  echo "  --update                         Update csw to the latest version"
-  echo "  -v, --version                    Show csw version"
-  echo "  --help                           Show this help message"
+  title "Commands:"
+  dimln "  --add-account                    Add current account to managed accounts"
+  dimln "  --remove-account <num|email>     Remove account by number or email"
+  dimln "  --list                           List all managed accounts"
+  dimln "  --switch                         Rotate to next account in sequence"
+  dimln "  --switch-to <num|email>          Switch to specific account number or email"
+  dimln "  --check-update                   Check for updates"
+  dimln "  --update                         Update csw to the latest version"
+  dimln "  -v, --version                    Show csw version"
+  dimln "  --help                           Show this help message"
 }
 
 main() {
   if [[ ${EUID:-$(id -u)} -eq 0 ]] && ! is_running_in_container; then
-    echo "Error: Do not run this script as root (unless running in a container)"
+    error "Do not run this script as root (unless running in a container)"
     exit 1
   fi
 
@@ -857,7 +884,7 @@ main() {
 
   case "${1:-}" in
   -v|--version|version)
-    echo "csw version ${CSW_VERSION}"
+    success "csw version ${CSW_VERSION}"
     ;;
 
   -check-update|--check-update|check-update)
@@ -895,7 +922,7 @@ main() {
     ;;
 
   *)
-    echo "Error: Unknown command '$1'"
+    error "Unknown command '$1'"
     show_usage
     exit 1
     ;;

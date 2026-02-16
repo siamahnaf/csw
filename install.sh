@@ -14,13 +14,20 @@ RED="$(printf '\033[31m')"
 GREEN="$(printf '\033[32m')"
 YELLOW="$(printf '\033[33m')"
 BLUE="$(printf '\033[34m')"
+MAGENTA="$(printf '\033[35m')"
+CYAN="$(printf '\033[36m')"
 BOLD="$(printf '\033[1m')"
+DIM="$(printf '\033[2m')"
 RESET="$(printf '\033[0m')"
 
-info()    { printf "%s%s[INFO]%s %s\n"   "$BLUE"  "$BOLD" "$RESET" "$*"; }
+# ---------- Styled helpers ----------
+info()    { printf "%s%s[INFO]%s %s\n"   "$BLUE"   "$BOLD" "$RESET" "$*"; }
 warn()    { printf "%s%s[WARN]%s %s\n"   "$YELLOW" "$BOLD" "$RESET" "$*"; }
-success() { printf "%s%s[OK]%s   %s\n"   "$GREEN" "$BOLD" "$RESET" "$*"; }
-error()   { printf "%s%s[ERR]%s  %s\n"   "$RED"   "$BOLD" "$RESET" "$*"; }
+success() { printf "%s%s[OK]%s   %s\n"   "$GREEN"  "$BOLD" "$RESET" "$*"; }
+error()   { printf "%s%s[ERR]%s  %s\n"   "$RED"    "$BOLD" "$RESET" "$*"; }
+step()    { printf "%s%s==>%s %s\n"      "$CYAN"   "$BOLD" "$RESET" "$*"; }
+kv()      { printf "  %s%s%-10s%s %s\n"  "$DIM"    "$BOLD" "$1:" "$RESET" "$2"; }
+hr()      { printf "%s%s────────────────────────────────────────%s\n" "$DIM" "$BOLD" "$RESET"; }
 
 mkdir -p "$BIN_DIR" "$LIB_DIR"
 
@@ -28,26 +35,40 @@ tmp="$(mktemp -d)"
 cleanup() { rm -rf "$tmp"; }
 trap cleanup EXIT
 
-info "Downloading csw from ${REPO}@${BRANCH}..."
+hr
+printf "%s%sCSW Installer%s %s%s(%s@%s)%s\n" \
+  "$MAGENTA" "$BOLD" "$RESET" \
+  "$DIM" "$BOLD" "$REPO" "$BRANCH" "$RESET"
+hr
+kv "Prefix" "$PREFIX"
+kv "Bin"    "$BIN_DIR"
+kv "Lib"    "$LIB_DIR"
+hr
+
+step "Downloading csw..."
+info "Source: ${REPO}@${BRANCH}"
 if ! curl -fsSL "$REPO_TARBALL" -o "$tmp/repo.tar.gz"; then
   error "Download failed. Check your internet or repo/branch name."
   exit 1
 fi
+success "Downloaded tarball"
 
-info "Extracting..."
+step "Extracting..."
 tar -xzf "$tmp/repo.tar.gz" -C "$tmp"
+success "Extracted"
 
 REPO_DIR="$(find "$tmp" -maxdepth 1 -type d -name 'csw-*' | head -n 1)"
 if [[ -z "${REPO_DIR:-}" || ! -d "$REPO_DIR" ]]; then
   error "Could not locate extracted repo folder."
   exit 1
 fi
+info "Repo dir: $REPO_DIR"
 
-info "Installing files..."
+step "Installing files..."
 cp -f "$REPO_DIR/ccswitch.sh" "$LIB_DIR/ccswitch.sh"
 cp -f "$REPO_DIR/bin/csw" "$BIN_DIR/csw"
-
 chmod +x "$LIB_DIR/ccswitch.sh" "$BIN_DIR/csw"
+success "Installed binaries"
 
 # ---- Read installed version from the installed script ----
 installed_version="$(
@@ -57,13 +78,17 @@ if [[ -z "${installed_version:-}" ]]; then
   installed_version="unknown"
 fi
 
-success "Installed: $BIN_DIR/csw"
-success "Library:   $LIB_DIR/ccswitch.sh"
-success "Version:   ${installed_version}"
+hr
+success "Installed:"
+kv "Binary"   "$BIN_DIR/csw"
+kv "Library"  "$LIB_DIR/ccswitch.sh"
+kv "Version"  "${installed_version}"
+hr
 
 echo
 warn "If 'csw' is not found, add to PATH:"
 printf "  %sexport PATH=\"\$HOME/.local/bin:\$PATH\"%s\n" "$BOLD" "$RESET"
+
 echo
 info "zsh:"
-printf "  echo 'export PATH=\"\$HOME/.local/bin:\$PATH\"' >> ~/.zshrc && source ~/.zshrc\n"
+printf "  %secho 'export PATH=\"\$HOME/.local/bin:\$PATH\"' >> ~/.zshrc && source ~/.zshrc%s\n" "$BOLD" "$RESET"
