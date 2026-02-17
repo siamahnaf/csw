@@ -3,7 +3,7 @@
 
 set -euo pipefail
 
-readonly CSW_VERSION="2.1.9"
+readonly CSW_VERSION="2.3.0"
 
 # Repo info (used for update checks)
 readonly CSW_REPO="siamahnaf/csw"
@@ -102,54 +102,12 @@ write_json() {
 
 resolve_account_identifier() {
   local identifier="$1"
-
   [[ "$identifier" =~ ^[0-9]+$ ]] && { echo "$identifier"; return 0; }
   [[ ! -f "$SEQUENCE_FILE" ]] && { echo ""; return 0; }
 
   jq -r --arg email "$identifier" '
     (.accounts | to_entries[]? | select(.value.email == $email) | .key) // empty
   ' "$SEQUENCE_FILE" 2>/dev/null | head -n 1
-}
-
-# Remove API-key-related settings so OAuth switching doesn't conflict.
-# (Fixes "Auth conflict: token + /login managed key")
-sanitize_config_json() {
-  local json="$1"
-  # Delete all known API-key/helper fields. Safe if absent.
-  # Keep permissive (doesn't break older/newer configs).
-  printf '%s' "$json" | jq '
-    del(
-      .apiKeyHelper,
-      .apiKey,
-      .anthropicApiKey,
-      .claudeApiKey,
-      .managedApiKey,
-      .externalApiKey,
-      .loginApiKey,
-      .enterpriseApiKey,
-      .organizationApiKey,
-      .apiKeySource,
-      .hasApiKey
-    )
-  ' 2>/dev/null || printf '%s' "$json"
-}
-
-# Remove API-key fields from credentials JSON, keeping only OAuth token.
-# Prevents a stored backup that contains both OAuth + API key from
-# reintroducing the auth-conflict warning when the backup is restored.
-sanitize_credentials_json() {
-  local json="$1"
-  printf '%s' "$json" | jq '
-    del(
-      .apiKey,
-      .anthropicApiKey,
-      .claudeApiKey,
-      .managedApiKey,
-      .externalApiKey,
-      .apiKeyHelper,
-      .loginApiKey
-    )
-  ' 2>/dev/null || printf '%s' "$json"
 }
 
 # -----------------------------
@@ -279,8 +237,8 @@ cmd_update() {
 # Directory setup
 # -----------------------------
 setup_directories() {
-  mkdir -p "$BACKUP_DIR/configs" "$BACKUP_DIR/credentials"
-  chmod 700 "$BACKUP_DIR" "$BACKUP_DIR/configs" "$BACKUP_DIR/credentials"
+  mkdir -p "$BACKUP_DIR/configs" "$BACKUP_DIR/credentials" "$BACKUP_DIR/settings"
+  chmod 700 "$BACKUP_DIR" "$BACKUP_DIR/configs" "$BACKUP_DIR/credentials" "$BACKUP_DIR/settings"
 }
 
 # -----------------------------
@@ -311,6 +269,73 @@ get_current_account() {
 }
 
 # -----------------------------
+# settings.json auth-conflict fix
+# -----------------------------
+_get_user_settings_path() {
+  echo "$HOME/.claude/settings.json"
+}
+
+_sanitize_settings_json() {
+  # Removes API-key based auth config that conflicts with OAuth switching:
+  # - apiKeyHelper
+  # - env keys that inject API keys/tokens
+  jq '
+    del(.apiKeyHelper)
+    | if (.env? and (.env | type) == "object") then
+        .env |= del(
+          "ANTHROPIC_API_KEY",
+          "CLAUDE_API_KEY",
+          "CLAUDE_CODE_OAUTH_TOKEN",
+          "ANTHROPIC_AUTH_TOKEN"
+        )
+      else .
+      end
+  '
+}
+
+_apply_oauth_mode_settings() {
+  # Ensure user settings do not force API-key auth while we switch OAuth accounts.
+  setup_directories
+
+  local settings_path
+  settings_path="$(_get_user_settings_path)"
+
+  # Warn if managed settings may be injecting apiKeyHelper (cannot edit without sudo)
+  local managed_path="/Library/Application Support/ClaudeCode/managed-settings.json"
+  if [[ -f "$managed_path" ]]; then
+    if jq -e '.apiKeyHelper? // empty | length > 0' "$managed_path" >/dev/null 2>&1; then
+      warn "Managed settings define apiKeyHelper at: $managed_path"
+      warn "This can cause the auth conflict warning and cannot be changed by csw without sudo."
+    fi
+  fi
+
+  [[ ! -f "$settings_path" ]] && return 0
+
+  if ! jq . "$settings_path" >/dev/null 2>&1; then
+    warn "Skipping settings.json sanitization (invalid JSON): $settings_path"
+    return 0
+  fi
+
+  local before after
+  before="$(cat "$settings_path")"
+  after="$(cat "$settings_path" | _sanitize_settings_json 2>/dev/null || true)"
+  [[ -z "$after" ]] && return 0
+
+  # Only write if it actually changes something
+  if [[ "$before" != "$after" ]]; then
+    local ts backup
+    ts="$(date -u +%Y%m%dT%H%M%SZ)"
+    backup="$BACKUP_DIR/settings/settings.json.${ts}.bak"
+    cp -f "$settings_path" "$backup"
+    chmod 600 "$backup" || true
+
+    write_json "$settings_path" "$after"
+    success "Sanitized user settings to avoid auth conflict: $settings_path"
+    dimln "  Backup saved: $backup"
+  fi
+}
+
+# -----------------------------
 # FIX: macOS Keychain credential service mismatch (space-safe)
 # -----------------------------
 _keychain_services() {
@@ -325,13 +350,6 @@ _keychain_read_service() {
 _keychain_write_service() {
   local service="$1" payload="$2"
   security add-generic-password -U -s "$service" -a "$USER" -w "$payload" 2>/dev/null
-}
-
-_keychain_delete_service() {
-  local service="$1"
-  # Delete all entries for this service (loop because there may be multiple account names)
-  while security delete-generic-password -s "$service" 2>/dev/null; do :; done
-  return 0
 }
 
 # -----------------------------
@@ -370,14 +388,10 @@ write_credentials() {
         error "Refusing to write invalid JSON credentials to Keychain"
         return 1
       fi
-      # Write only to the primary service ("Claude Code-credentials").
-      # Writing to the legacy "Claude Code" service creates a Keychain entry that
-      # Claude Code interprets as a managed/API key, triggering the auth-conflict
-      # warning "Both a token (claude.ai) and an API key (/login managed key) are set."
-      _keychain_write_service "Claude Code-credentials" "$credentials"
-      # Remove any leftover "Claude Code" entry (old API key or stale csw write)
-      # so Claude Code cannot detect a false managed-key conflict.
-      _keychain_delete_service "Claude Code"
+      local service=""
+      while IFS= read -r service; do
+        _keychain_write_service "$service" "$credentials"
+      done < <(_keychain_services)
       ;;
     linux|wsl)
       mkdir -p "$HOME/.claude"
@@ -466,6 +480,9 @@ cmd_add_account() {
   setup_directories
   init_sequence_file
 
+  # Ensure settings.json isn't forcing API-key auth when we're in OAuth switching mode
+  _apply_oauth_mode_settings
+
   local current_email; current_email="$(get_current_account)"
   [[ "$current_email" == "none" ]] && { error "No active Claude account found. Please log in first."; exit 1; }
 
@@ -481,12 +498,7 @@ cmd_add_account() {
   current_creds="$(read_credentials)"
   current_config="$(cat "$cfg_path")"
 
-  [[ -z "$current_creds" ]] && { error "No credentials found/readable for current account (Keychain service mismatch or permissions)."; exit 1; }
-
-  # Sanitize both credentials and config before storing backup
-  # (prevents auth conflict when backup is restored during a switch)
-  current_creds="$(sanitize_credentials_json "$current_creds")"
-  current_config="$(sanitize_config_json "$current_config")"
+  [[ -z "$current_creds" ]] && { error "No credentials found/readable for current account (Keychain mismatch or permissions)."; exit 1; }
 
   local account_uuid
   account_uuid="$(jq -r '.oauthAccount.accountUuid' "$cfg_path")"
@@ -523,6 +535,7 @@ cmd_remove_account() {
   [[ -z "$account_info" ]] && { error "Account-$account_num does not exist"; exit 1; }
 
   local email; email="$(printf '%s' "$account_info" | jq -r '.email')"
+
   local active_account; active_account="$(jq -r '.activeAccountNumber' "$SEQUENCE_FILE")"
   [[ "$active_account" == "$account_num" ]] && warn "Account-$account_num ($email) is currently active"
 
@@ -574,6 +587,7 @@ cmd_list() {
   fi
 
   local current_email; current_email="$(get_current_account)"
+
   local active_account_num=""
   if [[ "$current_email" != "none" ]]; then
     active_account_num="$(jq -r --arg email "$current_email" '
@@ -657,7 +671,11 @@ get_current_managed_account_num() {
 
 perform_switch() {
   local target_account="$1"
+
   wait_for_claude_close
+
+  # Ensure settings.json isn't forcing API-key auth while we switch OAuth accounts
+  _apply_oauth_mode_settings
 
   local target_email
   target_email="$(jq -r --arg num "$target_account" '.accounts[$num].email // empty' "$SEQUENCE_FILE")"
@@ -671,14 +689,14 @@ perform_switch() {
   local current_creds current_config
   current_creds="$(read_credentials)"
   current_config="$(cat "$cfg_path")"
-  # Sanitize both before storing backup to prevent auth conflict on restore
-  current_creds="$(sanitize_credentials_json "$current_creds")"
-  current_config="$(sanitize_config_json "$current_config")"
 
   if [[ -n "$current_account" && "$current_account" != "null" && "$current_email" != "none" ]]; then
     step "Saving current account backup..."
-    [[ -n "$current_creds" ]] && write_account_credentials "$current_account" "$current_email" "$current_creds" \
-      || warn "Could not read current credentials; skipping credentials backup."
+    if [[ -n "$current_creds" ]]; then
+      write_account_credentials "$current_account" "$current_email" "$current_creds"
+    else
+      warn "Could not read current credentials; skipping credentials backup."
+    fi
     write_account_config "$current_account" "$current_email" "$current_config"
     success "Backed up: Account-$current_account ($current_email)"
   fi
@@ -687,9 +705,6 @@ perform_switch() {
   target_creds="$(read_account_credentials "$target_account" "$target_email")"
   target_config="$(read_account_config "$target_account" "$target_email")"
   [[ -z "$target_creds" || -z "$target_config" ]] && { error "Missing backup data for Account-$target_account"; exit 1; }
-  # Defense-in-depth: sanitize target credentials before applying
-  # (handles old backups that may have been stored without sanitization)
-  target_creds="$(sanitize_credentials_json "$target_creds")"
 
   step "Applying target credentials/config..."
   write_credentials "$target_creds"
@@ -698,18 +713,9 @@ perform_switch() {
   oauth_section="$(printf '%s' "$target_config" | jq '.oauthAccount' 2>/dev/null || true)"
   [[ -z "$oauth_section" || "$oauth_section" == "null" ]] && { error "Invalid oauthAccount in backup"; exit 1; }
 
-  # Merge oauthAccount from target and strip all API-key fields to avoid auth-conflict warning
   local merged_config
-  merged_config="$(jq --argjson oauth "$oauth_section" '
-      del(
-        .apiKeyHelper, .apiKey, .anthropicApiKey, .claudeApiKey,
-        .managedApiKey, .externalApiKey,
-        .loginApiKey, .enterpriseApiKey, .organizationApiKey,
-        .apiKeySource, .hasApiKey
-      )
-      | .oauthAccount = $oauth
-    ' "$cfg_path" 2>/dev/null)"
-  [[ $? -ne 0 || -z "$merged_config" ]] && { error "Failed to merge config"; exit 1; }
+  merged_config="$(jq --argjson oauth "$oauth_section" '.oauthAccount = $oauth' "$cfg_path" 2>/dev/null)" \
+    || { error "Failed to merge config"; exit 1; }
 
   write_json "$cfg_path" "$merged_config"
 
