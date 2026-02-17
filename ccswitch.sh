@@ -5,7 +5,25 @@
 
 set -euo pipefail
 
-readonly CSW_VERSION="2.1.3"
+# ---- HARDENING: never "silent exit" again ----
+# Enable tracing: CSW_DEBUG=1 csw -v
+if [[ "${CSW_DEBUG:-0}" == "1" ]]; then
+  set -x
+fi
+
+# Print a useful error if anything fails under `set -e`
+_csw_err_trap() {
+  local ec=$?
+  local line=${BASH_LINENO[0]:-?}
+  local cmd=${BASH_COMMAND:-?}
+  printf '[ERR] csw crashed (exit=%s) at line %s: %s\n' "$ec" "$line" "$cmd" >&2
+  printf '      Tip: run with CSW_DEBUG=1 for full trace\n' >&2
+  exit "$ec"
+}
+trap _csw_err_trap ERR
+# ---------------------------------------------
+
+readonly CSW_VERSION="2.1.4"
 readonly CSW_REPO="siamahnaf/csw"
 readonly CSW_DEFAULT_BRANCH="main"
 
