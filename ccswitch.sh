@@ -4,7 +4,7 @@
 
 set -euo pipefail
 
-readonly CSW_VERSION="2.1.1"
+readonly CSW_VERSION="2.1.2"
 readonly CSW_REPO="siamahnaf/csw"
 readonly CSW_DEFAULT_BRANCH="main"
 
@@ -14,22 +14,35 @@ readonly MAX_HISTORY=12
 readonly SCHEMA_VERSION="2.0"
 
 # -----------------------------
-# Color / Styled output (toggle)
+# Pre-parse flags before color init
 # -----------------------------
 NO_COLOR="${NO_COLOR:-0}"
-if [[ "$NO_COLOR" -eq 0 ]] && [[ -t 1 ]]; then
-  RED="$(printf '\033[31m')"
-  GREEN="$(printf '\033[32m')"
-  YELLOW="$(printf '\033[33m')"
-  BLUE="$(printf '\033[34m')"
-  MAGENTA="$(printf '\033[35m')"
-  CYAN="$(printf '\033[36m')"
-  BOLD="$(printf '\033[1m')"
-  DIM="$(printf '\033[2m')"
-  RESET="$(printf '\033[0m')"
-else
-  RED=""; GREEN=""; YELLOW=""; BLUE=""; MAGENTA=""; CYAN=""; BOLD=""; DIM=""; RESET=""
-fi
+for _arg in "$@"; do
+  if [[ "$_arg" == "--no-color" ]]; then
+    NO_COLOR=1
+    break
+  fi
+done
+
+# -----------------------------
+# Color / Styled output (toggle)
+# -----------------------------
+_apply_colors() {
+  if [[ "${NO_COLOR:-0}" -eq 0 ]] && [[ -t 1 ]]; then
+    RED="$(printf '\033[31m')"
+    GREEN="$(printf '\033[32m')"
+    YELLOW="$(printf '\033[33m')"
+    BLUE="$(printf '\033[34m')"
+    MAGENTA="$(printf '\033[35m')"
+    CYAN="$(printf '\033[36m')"
+    BOLD="$(printf '\033[1m')"
+    DIM="$(printf '\033[2m')"
+    RESET="$(printf '\033[0m')"
+  else
+    RED=""; GREEN=""; YELLOW=""; BLUE=""; MAGENTA=""; CYAN=""; BOLD=""; DIM=""; RESET=""
+  fi
+}
+_apply_colors
 
 info()    { printf "%s%s[INFO]%s %s\n" "$BLUE"   "$BOLD" "$RESET" "$*"; }
 warn()    { printf "%s%s[WARN]%s %s\n" "$YELLOW" "$BOLD" "$RESET" "$*"; }
@@ -45,9 +58,7 @@ hr()      { printf "%s%s──────────────────�
 # -----------------------------
 SPINNER_PID=""
 _spinner_start() {
-  # usage: _spinner_start "Doing something..."
   local msg="${1:-Working...}"
-  # if not a TTY, don't animate
   [[ ! -t 1 ]] && { step "$msg"; return 0; }
   step "$msg"
   (
@@ -63,17 +74,14 @@ _spinner_start() {
 }
 
 _spinner_stop() {
-  # usage: _spinner_stop "Done" (optional)
   local msg="${1:-Done}"
   if [[ -n "${SPINNER_PID:-}" ]]; then
     kill "$SPINNER_PID" >/dev/null 2>&1 || true
     wait "$SPINNER_PID" >/dev/null 2>&1 || true
     SPINNER_PID=""
     [[ -t 1 ]] && printf "\r%s\r" "                                "
-    success "$msg"
-  else
-    success "$msg"
   fi
+  success "$msg"
 }
 
 _spinner_fail() {
@@ -87,7 +95,6 @@ _spinner_fail() {
   error "$msg"
 }
 
-# Ensure spinner is stopped on exit
 cleanup_spinner() { [[ -n "${SPINNER_PID:-}" ]] && _spinner_fail "Interrupted"; }
 trap cleanup_spinner INT TERM
 
@@ -124,7 +131,8 @@ get_claude_config_path() {
 
   if [[ -f "$primary" ]]; then
     if jq -e '.oauthAccount' "$primary" >/dev/null 2>&1; then
-      echo "$primary"; return
+      echo "$primary"
+      return
     fi
   fi
   echo "$fallback"
@@ -208,20 +216,21 @@ _check_update_available() {
   [[ -z "${tag:-}" ]] && return 2
   latest="$(_strip_v_prefix "$tag")"
   if _semver_gt "$latest" "$CSW_VERSION"; then
-    echo "$latest"; return 0
+    echo "$latest"
+    return 0
   fi
   return 1
 }
 
 cmd_check_update() {
-  local latest
+  local latest rc
   _spinner_start "Checking for updates"
   if latest="$(_check_update_available)"; then
     _spinner_stop "Update available: ${CSW_VERSION} -> ${latest}"
     info "Run: csw --update"
     return 0
   fi
-  local rc=$?
+  rc=$?
   _spinner_stop "Checked"
   case "$rc" in
     1) success "You are up to date: ${CSW_VERSION}" ;;
@@ -271,6 +280,7 @@ cmd_update() {
     success "Done."
     return 0
   fi
+
   warn "No GitHub releases found. Updating from branch '${CSW_DEFAULT_BRANCH}'..."
   tarball="https://codeload.github.com/${CSW_REPO}/tar.gz/refs/heads/${CSW_DEFAULT_BRANCH}"
   _install_from_tarball "$tarball"
@@ -304,21 +314,19 @@ wait_for_claude_close() {
 # Current account
 # -----------------------------
 get_current_account() {
-  local cfg; cfg="$(get_claude_config_path)"
+  local cfg email
+  cfg="$(get_claude_config_path)"
   [[ ! -f "$cfg" ]] && { echo "none"; return 0; }
   validate_json_file "$cfg" || { echo "none"; return 0; }
-  local email
   email="$(jq -r '.oauthAccount.emailAddress // empty' "$cfg" 2>/dev/null || true)"
   echo "${email:-none}"
 }
 
 # -----------------------------
-# Credentials I/O
-# Fix: macOS stores creds under varying Keychain "service" names.
-# Read from the service that has refreshToken; write to BOTH.
+# Credentials I/O (Keychain fix)
 # -----------------------------
 _keychain_services() {
-  # one service per line (important)
+  # one service per line (spaces-safe)
   printf '%s\n' "Claude Code-credentials" "Claude Code"
 }
 
@@ -341,13 +349,11 @@ read_credentials() {
         payload="$(_keychain_read_service "$line")"
         [[ -z "$payload" ]] && continue
 
-        # Prefer payload that has refreshToken
         if printf '%s' "$payload" | jq -e '.claudeAiOauth.refreshToken? // empty | length > 0' >/dev/null 2>&1; then
           best="$payload"
           break
         fi
 
-        # fallback: any valid JSON
         if [[ -z "$best" ]] && printf '%s' "$payload" | jq -e . >/dev/null 2>&1; then
           best="$payload"
         fi
@@ -497,12 +503,11 @@ resolve_account_identifier() {
   [[ "$id" =~ ^[0-9]+$ ]] && { echo "$id"; return 0; }
   [[ ! -f "$SEQUENCE_FILE" ]] && { echo ""; return 0; }
 
-  local by_email
+  local by_email by_alias
   by_email="$(jq -r --arg v "$id" '(.accounts | to_entries[]? | select(.value.email == $v) | .key) // empty' \
     "$SEQUENCE_FILE" 2>/dev/null | head -n 1)"
   [[ -n "$by_email" ]] && { echo "$by_email"; return 0; }
 
-  local by_alias
   by_alias="$(jq -r --arg v "$id" '(.accounts | to_entries[]? | select((.value.alias // "") == $v) | .key) // empty' \
     "$SEQUENCE_FILE" 2>/dev/null | head -n 1)"
   [[ -n "$by_alias" ]] && { echo "$by_alias"; return 0; }
@@ -529,7 +534,8 @@ cmd_add_account() {
   init_sequence_file
   migrate_sequence_file
 
-  local current_email; current_email="$(get_current_account)"
+  local current_email cfg_path creds config num uuid now updated
+  current_email="$(get_current_account)"
   [[ "$current_email" == "none" ]] && { error "No active Claude account found. Please log in first."; exit 1; }
 
   if account_exists_by_email "$current_email"; then
@@ -537,8 +543,8 @@ cmd_add_account() {
     exit 0
   fi
 
-  local cfg_path; cfg_path="$(get_claude_config_path)"
-  local creds config
+  cfg_path="$(get_claude_config_path)"
+
   _spinner_start "Reading current credentials"
   creds="$(read_credentials)"
   _spinner_stop "Credentials read"
@@ -546,9 +552,7 @@ cmd_add_account() {
   [[ -z "$creds" ]] && { error "Could not read credentials from Keychain"; exit 1; }
 
   config="$(cat "$cfg_path")"
-
-  local num; num="$(get_next_account_number)"
-  local uuid now
+  num="$(get_next_account_number)"
   uuid="$(jq -r '.oauthAccount.accountUuid // empty' "$cfg_path" 2>/dev/null || true)"
   now="$(utc_now)"
 
@@ -557,7 +561,6 @@ cmd_add_account() {
   write_account_config "$num" "$current_email" "$config"
   _spinner_stop "Backups saved"
 
-  local updated
   updated="$(jq --arg num "$num" --arg email "$current_email" --arg uuid "$uuid" --arg now "$now" '
     .accounts[$num] = {
       email: $email,
@@ -581,10 +584,10 @@ cmd_sync() {
   init_sequence_file
   migrate_sequence_file
 
-  local current_email; current_email="$(get_current_account)"
+  local current_email num cfg_path creds config now updated
+  current_email="$(get_current_account)"
   [[ "$current_email" == "none" ]] && { error "No active Claude account found. Please log in first."; exit 1; }
 
-  local num
   num="$(jq -r --arg email "$current_email" '(.accounts | to_entries[]? | select(.value.email == $email) | .key) // empty' \
     "$SEQUENCE_FILE" 2>/dev/null | head -n 1)"
   if [[ -z "$num" ]]; then
@@ -593,8 +596,8 @@ cmd_sync() {
     return 0
   fi
 
-  local cfg_path; cfg_path="$(get_claude_config_path)"
-  local creds config now
+  cfg_path="$(get_claude_config_path)"
+
   _spinner_start "Reading current credentials"
   creds="$(read_credentials)"
   _spinner_stop "Credentials read"
@@ -609,7 +612,6 @@ cmd_sync() {
   write_account_config "$num" "$current_email" "$config"
   _spinner_stop "Backups updated"
 
-  local updated
   updated="$(jq --arg num "$num" --arg now "$now" '
     .accounts[$num].lastUsed = $now
     | .accounts[$num].usageCount = ((.accounts[$num].usageCount // 0) + 1)
@@ -624,28 +626,32 @@ cmd_remove_account() {
   [[ ! -f "$SEQUENCE_FILE" ]] && { error "No accounts are managed yet"; exit 1; }
   migrate_sequence_file
 
-  local num; num="$(resolve_account_identifier "$1")"
+  local num email confirm platform now updated
+  num="$(resolve_account_identifier "$1")"
   [[ -z "$num" ]] && { error "No account found: $1"; exit 1; }
 
-  local email
   email="$(jq -r --arg num "$num" '.accounts[$num].email // empty' "$SEQUENCE_FILE")"
   [[ -z "$email" ]] && { error "Account-$num does not exist"; exit 1; }
 
   printf "%s%sRemove Account-%s (%s)?%s [y/N] " "$YELLOW" "$BOLD" "$num" "$email" "$RESET"
-  local confirm; read -r confirm
+  read -r confirm
   [[ "$confirm" != "y" && "$confirm" != "Y" ]] && { warn "Cancelled"; exit 0; }
 
-  local platform; platform="$(detect_platform)"
+  platform="$(detect_platform)"
+
   _spinner_start "Removing backups"
   case "$platform" in
-    macos) security delete-generic-password -s "Claude Code-Account-${num}-${email}" 2>/dev/null || true ;;
-    linux|wsl) rm -f "$BACKUP_DIR/credentials/.claude-credentials-${num}-${email}.json" ;;
+    macos)
+      security delete-generic-password -s "Claude Code-Account-${num}-${email}" 2>/dev/null || true
+      ;;
+    linux|wsl)
+      rm -f "$BACKUP_DIR/credentials/.claude-credentials-${num}-${email}.json"
+      ;;
   esac
   rm -f "$BACKUP_DIR/configs/.claude-config-${num}-${email}.json"
   _spinner_stop "Backups removed"
 
-  local now; now="$(utc_now)"
-  local updated
+  now="$(utc_now)"
   updated="$(jq --arg num "$num" --arg now "$now" '
     del(.accounts[$num])
     | .sequence = (.sequence | map(select(. != ($num|tonumber))))
@@ -660,8 +666,10 @@ cmd_list() {
   [[ ! -f "$SEQUENCE_FILE" ]] && { warn "No accounts are managed yet."; exit 0; }
   migrate_sequence_file
 
-  local current_email; current_email="$(get_current_account)"
-  local active_num=""
+  local current_email active_num
+  current_email="$(get_current_account)"
+  active_num=""
+
   if [[ "$current_email" != "none" ]]; then
     active_num="$(jq -r --arg email "$current_email" '(.accounts | to_entries[]? | select(.value.email == $email) | .key) // empty' \
       "$SEQUENCE_FILE" 2>/dev/null | head -n 1)"
@@ -686,7 +694,8 @@ cmd_status() {
   [[ ! -f "$SEQUENCE_FILE" ]] && { info "No accounts are managed yet."; exit 0; }
   migrate_sequence_file
 
-  local current_email; current_email="$(get_current_account)"
+  local current_email num alias lastUsed usage health
+  current_email="$(get_current_account)"
   title "Claude Code Account Status"
   echo ""
 
@@ -695,16 +704,13 @@ cmd_status() {
     return 0
   fi
 
-  local num
   num="$(jq -r --arg email "$current_email" '(.accounts | to_entries[]? | select(.value.email == $email) | .key) // empty' \
     "$SEQUENCE_FILE" 2>/dev/null | head -n 1)"
-
   if [[ -z "$num" ]]; then
     warn "Active: $current_email (not managed)"
     return 0
   fi
 
-  local alias lastUsed usage health
   alias="$(jq -r --arg num "$num" '.accounts[$num].alias // "none"' "$SEQUENCE_FILE")"
   lastUsed="$(jq -r --arg num "$num" '.accounts[$num].lastUsed // "unknown"' "$SEQUENCE_FILE")"
   usage="$(jq -r --arg num "$num" '.accounts[$num].usageCount // 0' "$SEQUENCE_FILE")"
@@ -743,14 +749,14 @@ cmd_set_alias() {
   [[ ! -f "$SEQUENCE_FILE" ]] && { error "No accounts are managed yet"; exit 1; }
   migrate_sequence_file
 
-  local num; num="$(resolve_account_identifier "$1")"
+  local num alias now updated
+  num="$(resolve_account_identifier "$1")"
   [[ -z "$num" ]] && { error "No account found: $1"; exit 1; }
 
-  local alias="$2"
+  alias="$2"
   [[ ! "$alias" =~ ^[a-zA-Z0-9_-]+$ ]] && { error "Alias must be letters/numbers/_/- only"; exit 1; }
 
-  local now; now="$(utc_now)"
-  local updated
+  now="$(utc_now)"
   updated="$(jq --arg num "$num" --arg alias "$alias" --arg now "$now" '
     .accounts[$num].alias = $alias
     | .lastUpdated = $now
@@ -764,17 +770,17 @@ perform_switch() {
 
   wait_for_claude_close
 
-  local target_email
+  local target_email current_email current_num cfg_path current_creds current_config
   target_email="$(jq -r --arg num "$target" '.accounts[$num].email // empty' "$SEQUENCE_FILE")"
   [[ -z "$target_email" ]] && { error "Could not resolve target email"; exit 1; }
 
-  local current_email; current_email="$(get_current_account)"
-  local current_num; current_num="$(get_current_managed_num "$current_email")"
+  current_email="$(get_current_account)"
+  current_num="$(get_current_managed_num "$current_email")"
   [[ -z "$current_num" ]] && current_num="$(jq -r '.activeAccountNumber // empty' "$SEQUENCE_FILE")"
   [[ -z "$current_num" || "$current_num" == "null" ]] && current_num="0"
 
-  local cfg_path; cfg_path="$(get_claude_config_path)"
-  local current_creds current_config
+  cfg_path="$(get_claude_config_path)"
+
   _spinner_start "Reading current state"
   current_creds="$(read_credentials)"
   current_config="$(cat "$cfg_path")"
@@ -811,8 +817,8 @@ perform_switch() {
   write_json "$cfg_path" "$merged"
   _spinner_stop "Config updated"
 
-  local now; now="$(utc_now)"
-  local updated
+  local now updated
+  now="$(utc_now)"
   updated="$(jq --arg num "$target" --arg now "$now" '
     .activeAccountNumber = ($num|tonumber)
     | .lastUpdated = $now
@@ -837,20 +843,21 @@ cmd_switch() {
   [[ ! -f "$SEQUENCE_FILE" ]] && { error "No accounts are managed yet"; exit 1; }
   migrate_sequence_file
 
-  local current_email; current_email="$(get_current_account)"
+  local current_email next num
+  current_email="$(get_current_account)"
   [[ "$current_email" == "none" ]] && { error "No active Claude account found"; exit 1; }
 
   if ! account_exists_by_email "$current_email"; then
     warn "Active account '$current_email' was not managed."
     info "Adding it automatically..."
     cmd_add_account
-    local num; num="$(jq -r '.activeAccountNumber' "$SEQUENCE_FILE")"
+    num="$(jq -r '.activeAccountNumber' "$SEQUENCE_FILE")"
     success "Added as Account-$num."
     info "Run 'csw --switch' again to rotate."
     exit 0
   fi
 
-  local next; next="$(get_next_in_sequence)"
+  next="$(get_next_in_sequence)"
   [[ -z "$next" ]] && { error "No accounts in sequence."; exit 1; }
   perform_switch "$next"
 }
@@ -860,7 +867,8 @@ cmd_switch_to() {
   [[ ! -f "$SEQUENCE_FILE" ]] && { error "No accounts are managed yet"; exit 1; }
   migrate_sequence_file
 
-  local target; target="$(resolve_account_identifier "$1")"
+  local target
+  target="$(resolve_account_identifier "$1")"
   [[ -z "$target" ]] && { error "No account found: $1"; exit 1; }
   perform_switch "$target"
 }
@@ -870,12 +878,11 @@ cmd_verify() {
   migrate_sequence_file
 
   title "Verification"
-  local any_bad=0
-  local nums; nums="$(jq -r '.sequence[]?' "$SEQUENCE_FILE")"
+  local any_bad=0 nums num
 
-  local num
+  nums="$(jq -r '.sequence[]?' "$SEQUENCE_FILE")"
   for num in $nums; do
-    local email creds config health="healthy"
+    local email creds config health="healthy" now updated
     email="$(jq -r --arg num "$num" '.accounts[$num].email // empty' "$SEQUENCE_FILE")"
     creds="$(read_account_credentials "$num" "$email")"
     config="$(read_account_config "$num" "$email")"
@@ -890,8 +897,7 @@ cmd_verify() {
       printf "  %s⚠%s Account-%s (%s): no refreshToken\n" "$YELLOW" "$RESET" "$num" "$email"
     fi
 
-    local now; now="$(utc_now)"
-    local updated
+    now="$(utc_now)"
     updated="$(jq --arg num "$num" --arg health "$health" --arg now "$now" '
       .accounts[$num].healthStatus = $health
       | .lastUpdated = $now
@@ -912,7 +918,8 @@ cmd_history() {
   [[ ! -f "$SEQUENCE_FILE" ]] && { info "No history yet."; exit 0; }
   migrate_sequence_file
 
-  local n; n="$(jq -r '(.history // []) | length' "$SEQUENCE_FILE")"
+  local n
+  n="$(jq -r '(.history // []) | length' "$SEQUENCE_FILE")"
   [[ "$n" -eq 0 ]] && { info "No history yet."; exit 0; }
 
   title "Switch History (newest first)"
@@ -921,7 +928,7 @@ cmd_history() {
     from="$(printf '%s' "$entry" | jq -r '.from')"
     to="$(printf '%s' "$entry" | jq -r '.to')"
     ts="$(printf '%s' "$entry" | jq -r '.timestamp')"
-    printf "  %s%s%s %s->%s %s\n" "$DIM" "$ts" "$RESET" "$from" "$to" ""
+    printf "  %s%s%s %s->%s\n" "$DIM" "$ts" "$RESET" "$from" "$to"
   done
 }
 
@@ -929,10 +936,10 @@ cmd_undo() {
   [[ ! -f "$SEQUENCE_FILE" ]] && { error "No accounts are managed yet"; exit 1; }
   migrate_sequence_file
 
-  local n; n="$(jq -r '(.history // []) | length' "$SEQUENCE_FILE")"
+  local n last from
+  n="$(jq -r '(.history // []) | length' "$SEQUENCE_FILE")"
   [[ "$n" -eq 0 ]] && { error "No history to undo"; exit 1; }
 
-  local last from
   last="$(jq -c '(.history // []) | last' "$SEQUENCE_FILE")"
   from="$(printf '%s' "$last" | jq -r '.from')"
   [[ -z "$from" || "$from" == "null" ]] && { error "Bad history entry"; exit 1; }
@@ -946,8 +953,8 @@ cmd_export() {
   [[ ! -f "$SEQUENCE_FILE" ]] && { error "No accounts to export"; exit 1; }
   migrate_sequence_file
 
-  local out="$1"
-  local tmp; tmp="$(mktemp -d)"
+  local out="$1" tmp
+  tmp="$(mktemp -d)"
   # shellcheck disable=SC2064
   trap "rm -rf \"$tmp\"" EXIT
 
@@ -978,14 +985,16 @@ cmd_import() {
   [[ ! -f "$arc" ]] && { error "Archive not found: $arc"; exit 1; }
 
   printf "%s%sThis will merge imported accounts. Continue?%s [y/N] " "$YELLOW" "$BOLD" "$RESET"
-  local confirm; read -r confirm
+  local confirm
+  read -r confirm
   [[ "$confirm" != "y" && "$confirm" != "Y" ]] && { warn "Cancelled"; exit 0; }
 
   setup_directories
   init_sequence_file
   migrate_sequence_file
 
-  local tmp; tmp="$(mktemp -d)"
+  local tmp
+  tmp="$(mktemp -d)"
   # shellcheck disable=SC2064
   trap "rm -rf \"$tmp\"" EXIT
 
@@ -997,45 +1006,43 @@ cmd_import() {
 
   _spinner_start "Merging accounts"
   jq -c '.accounts | to_entries[] | {email:.value.email, uuid:(.value.uuid//""), alias:(.value.alias//null)}' "$tmp/sequence.json" \
-  | while IFS= read -r row; do
-      local email uuid alias
-      email="$(printf '%s' "$row" | jq -r '.email')"
-      uuid="$(printf '%s' "$row" | jq -r '.uuid')"
-      alias="$(printf '%s' "$row" | jq -r '.alias // empty')"
+    | while IFS= read -r row; do
+        local email uuid alias num now updated cfg_file cred_file f
+        email="$(printf '%s' "$row" | jq -r '.email')"
+        uuid="$(printf '%s' "$row" | jq -r '.uuid')"
+        alias="$(printf '%s' "$row" | jq -r '.alias // empty')"
 
-      if account_exists_by_email "$email"; then
-        warn "Skipping existing: $email"
-        continue
-      fi
+        if account_exists_by_email "$email"; then
+          warn "Skipping existing: $email"
+          continue
+        fi
 
-      local num now
-      num="$(get_next_account_number)"
-      now="$(utc_now)"
+        num="$(get_next_account_number)"
+        now="$(utc_now)"
 
-      local cfg_file=""
-      for f in "$tmp/configs/.claude-config-"*"-${email}.json"; do
-        [[ -f "$f" ]] && { cfg_file="$f"; break; }
+        cfg_file=""
+        for f in "$tmp/configs/.claude-config-"*"-${email}.json"; do
+          [[ -f "$f" ]] && { cfg_file="$f"; break; }
+        done
+        [[ -n "$cfg_file" ]] && write_account_config "$num" "$email" "$(cat "$cfg_file")"
+
+        cred_file=""
+        for f in "$tmp/credentials/.claude-credentials-"*"-${email}.json"; do
+          [[ -f "$f" ]] && { cred_file="$f"; break; }
+        done
+        [[ -n "$cred_file" ]] && write_account_credentials "$num" "$email" "$(cat "$cred_file")"
+
+        updated="$(jq --arg num "$num" --arg email "$email" --arg uuid "$uuid" --arg now "$now" --arg alias "$alias" '
+          .accounts[$num] = {
+            email: $email, uuid: $uuid, added: $now,
+            alias: (if $alias=="" then null else $alias end),
+            lastUsed: null, usageCount: 0, healthStatus: "unknown"
+          }
+          | .sequence += [($num|tonumber)]
+          | .lastUpdated = $now
+        ' "$SEQUENCE_FILE")"
+        write_json "$SEQUENCE_FILE" "$updated"
       done
-      [[ -n "$cfg_file" ]] && write_account_config "$num" "$email" "$(cat "$cfg_file")"
-
-      local cred_file=""
-      for f in "$tmp/credentials/.claude-credentials-"*"-${email}.json"; do
-        [[ -f "$f" ]] && { cred_file="$f"; break; }
-      done
-      [[ -n "$cred_file" ]] && write_account_credentials "$num" "$email" "$(cat "$cred_file")"
-
-      local updated
-      updated="$(jq --arg num "$num" --arg email "$email" --arg uuid "$uuid" --arg now "$now" --arg alias "$alias" '
-        .accounts[$num] = {
-          email: $email, uuid: $uuid, added: $now,
-          alias: (if $alias=="" then null else $alias end),
-          lastUsed: null, usageCount: 0, healthStatus: "unknown"
-        }
-        | .sequence += [($num|tonumber)]
-        | .lastUpdated = $now
-      ' "$SEQUENCE_FILE")"
-      write_json "$SEQUENCE_FILE" "$updated"
-    done
   _spinner_stop "Merge complete"
   success "Import complete."
 }
@@ -1063,7 +1070,8 @@ cmd_interactive() {
     echo " 12) Import"
     echo "  0) Exit"
     printf "\n%s> %s" "$BOLD" "$RESET"
-    local choice; read -r choice
+    local choice
+    read -r choice
     case "$choice" in
       1) cmd_list ;;
       2) cmd_add_account ;;
@@ -1109,6 +1117,9 @@ show_usage() {
   dimln "  --help                           Help"
 }
 
+# -----------------------------
+# MAIN (rewritten safely)
+# -----------------------------
 main() {
   if [[ ${EUID:-$(id -u)} -eq 0 ]] && ! is_running_in_container; then
     error "Do not run as root (unless in a container)"
@@ -1118,27 +1129,96 @@ main() {
   check_dependencies
   setup_directories
 
+  # Handle --no-color safely (no recursion)
+  if [[ "${1:-}" == "--no-color" ]]; then
+    NO_COLOR=1
+    _apply_colors
+    shift || true
+  fi
+
   case "${1:-}" in
-    --no-color) NO_COLOR=1; shift; main "${1:-}";;
-    -v|--version|version) success "csw version ${CSW_VERSION}" ;;
-    --interactive|interactive|ui) cmd_interactive ;;
-    --check-update|check-update) cmd_check_update ;;
-    --update|update) cmd_update ;;
-    --add-account|add-account) cmd_add_account ;;
-    --sync|sync|repair) cmd_sync ;;
-    --remove-account|remove-account|rm-account) shift; cmd_remove_account "$@" ;;
-    --list|list|ls) cmd_list ;;
-    --status|status) cmd_status ;;
-    --switch|switch|next) cmd_switch ;;
-    --switch-to|switch-to|to) shift; cmd_switch_to "$@" ;;
-    --set-alias|set-alias|alias) shift; cmd_set_alias "$@" ;;
-    --verify|verify) cmd_verify ;;
-    --history|history) cmd_history ;;
-    --undo|undo) cmd_undo ;;
-    --export|export) shift; cmd_export "$@" ;;
-    --import|import) shift; cmd_import "$@" ;;
-    --help|help|-h|"") show_usage ;;
-    *) error "Unknown command '$1'"; show_usage; exit 1 ;;
+    -v|--version|version)
+      success "csw version ${CSW_VERSION}"
+      ;;
+
+    --interactive|interactive|ui)
+      cmd_interactive
+      ;;
+
+    --check-update|check-update)
+      cmd_check_update
+      ;;
+
+    --update|update)
+      cmd_update
+      ;;
+
+    --add-account|add-account)
+      cmd_add_account
+      ;;
+
+    --sync|sync|repair)
+      cmd_sync
+      ;;
+
+    --remove-account|remove-account|rm-account)
+      shift
+      cmd_remove_account "$@"
+      ;;
+
+    --list|list|ls)
+      cmd_list
+      ;;
+
+    --status|status)
+      cmd_status
+      ;;
+
+    --switch|switch|next)
+      cmd_switch
+      ;;
+
+    --switch-to|switch-to|to)
+      shift
+      cmd_switch_to "$@"
+      ;;
+
+    --set-alias|set-alias|alias)
+      shift
+      cmd_set_alias "$@"
+      ;;
+
+    --verify|verify)
+      cmd_verify
+      ;;
+
+    --history|history)
+      cmd_history
+      ;;
+
+    --undo|undo)
+      cmd_undo
+      ;;
+
+    --export|export)
+      shift
+      cmd_export "$@"
+      ;;
+
+    --import|import)
+      shift
+      cmd_import "$@"
+      ;;
+
+    --help|help|-h|"")
+      show_usage
+      ;;
+
+    *)
+      error "Unknown command '$1'"
+      show_usage
+      exit 1
+      ;;
   esac
 }
 
