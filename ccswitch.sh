@@ -4,7 +4,7 @@
 
 set -euo pipefail
 
-readonly CSW_VERSION="2.1.0"
+readonly CSW_VERSION="2.1.1"
 readonly CSW_REPO="siamahnaf/csw"
 readonly CSW_DEFAULT_BRANCH="main"
 
@@ -318,6 +318,7 @@ get_current_account() {
 # Read from the service that has refreshToken; write to BOTH.
 # -----------------------------
 _keychain_services() {
+  # one service per line (important)
   printf '%s\n' "Claude Code-credentials" "Claude Code"
 }
 
@@ -335,18 +336,22 @@ read_credentials() {
   local platform; platform="$(detect_platform)"
   case "$platform" in
     macos)
-      local s payload best=""
-      for s in $(_keychain_services); do
-        payload="$(_keychain_read_service "$s")"
+      local payload best="" line
+      while IFS= read -r line; do
+        payload="$(_keychain_read_service "$line")"
         [[ -z "$payload" ]] && continue
+
+        # Prefer payload that has refreshToken
         if printf '%s' "$payload" | jq -e '.claudeAiOauth.refreshToken? // empty | length > 0' >/dev/null 2>&1; then
           best="$payload"
           break
         fi
+
+        # fallback: any valid JSON
         if [[ -z "$best" ]] && printf '%s' "$payload" | jq -e . >/dev/null 2>&1; then
           best="$payload"
         fi
-      done
+      done < <(_keychain_services)
       printf '%s' "$best"
       ;;
     linux|wsl)
@@ -359,16 +364,18 @@ read_credentials() {
 write_credentials() {
   local credentials="$1"
   local platform; platform="$(detect_platform)"
+
   case "$platform" in
     macos)
       if ! printf '%s' "$credentials" | jq -e . >/dev/null 2>&1; then
         error "Refusing to write invalid JSON credentials"
         return 1
       fi
-      local s
-      for s in $(_keychain_services); do
-        _keychain_write_service "$s" "$credentials"
-      done
+
+      local line
+      while IFS= read -r line; do
+        _keychain_write_service "$line" "$credentials"
+      done < <(_keychain_services)
       ;;
     linux|wsl)
       mkdir -p "$HOME/.claude"
