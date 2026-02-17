@@ -3,7 +3,7 @@
 
 set -euo pipefail
 
-readonly CSW_VERSION="2.1.7"
+readonly CSW_VERSION="2.1.8"
 
 # Repo info (used for update checks)
 readonly CSW_REPO="siamahnaf/csw"
@@ -115,8 +115,8 @@ resolve_account_identifier() {
 # (Fixes "Auth conflict: token + /login managed key")
 sanitize_config_json() {
   local json="$1"
-  # We delete common key/helper fields. Safe if absent.
-  # Keep it permissive (doesn't break older/newer configs).
+  # Delete all known API-key/helper fields. Safe if absent.
+  # Keep permissive (doesn't break older/newer configs).
   printf '%s' "$json" | jq '
     del(
       .apiKeyHelper,
@@ -124,7 +124,30 @@ sanitize_config_json() {
       .anthropicApiKey,
       .claudeApiKey,
       .managedApiKey,
-      .externalApiKey
+      .externalApiKey,
+      .loginApiKey,
+      .enterpriseApiKey,
+      .organizationApiKey,
+      .apiKeySource,
+      .hasApiKey
+    )
+  ' 2>/dev/null || printf '%s' "$json"
+}
+
+# Remove API-key fields from credentials JSON, keeping only OAuth token.
+# Prevents a stored backup that contains both OAuth + API key from
+# reintroducing the auth-conflict warning when the backup is restored.
+sanitize_credentials_json() {
+  local json="$1"
+  printf '%s' "$json" | jq '
+    del(
+      .apiKey,
+      .anthropicApiKey,
+      .claudeApiKey,
+      .managedApiKey,
+      .externalApiKey,
+      .apiKeyHelper,
+      .loginApiKey
     )
   ' 2>/dev/null || printf '%s' "$json"
 }
@@ -304,6 +327,13 @@ _keychain_write_service() {
   security add-generic-password -U -s "$service" -a "$USER" -w "$payload" 2>/dev/null
 }
 
+_keychain_delete_service() {
+  local service="$1"
+  # Delete all entries for this service (loop because there may be multiple account names)
+  while security delete-generic-password -s "$service" 2>/dev/null; do :; done
+  return 0
+}
+
 # -----------------------------
 # Credentials I/O
 # -----------------------------
@@ -340,10 +370,14 @@ write_credentials() {
         error "Refusing to write invalid JSON credentials to Keychain"
         return 1
       fi
-      local service=""
-      while IFS= read -r service; do
-        _keychain_write_service "$service" "$credentials"
-      done < <(_keychain_services)
+      # Write only to the primary service ("Claude Code-credentials").
+      # Writing to the legacy "Claude Code" service creates a Keychain entry that
+      # Claude Code interprets as a managed/API key, triggering the auth-conflict
+      # warning "Both a token (claude.ai) and an API key (/login managed key) are set."
+      _keychain_write_service "Claude Code-credentials" "$credentials"
+      # Remove any leftover "Claude Code" entry (old API key or stale csw write)
+      # so Claude Code cannot detect a false managed-key conflict.
+      _keychain_delete_service "Claude Code"
       ;;
     linux|wsl)
       mkdir -p "$HOME/.claude"
@@ -449,7 +483,9 @@ cmd_add_account() {
 
   [[ -z "$current_creds" ]] && { error "No credentials found/readable for current account (Keychain service mismatch or permissions)."; exit 1; }
 
-  # sanitize config before storing backup (prevents auth conflict later)
+  # Sanitize both credentials and config before storing backup
+  # (prevents auth conflict when backup is restored during a switch)
+  current_creds="$(sanitize_credentials_json "$current_creds")"
   current_config="$(sanitize_config_json "$current_config")"
 
   local account_uuid
@@ -635,6 +671,8 @@ perform_switch() {
   local current_creds current_config
   current_creds="$(read_credentials)"
   current_config="$(cat "$cfg_path")"
+  # Sanitize both before storing backup to prevent auth conflict on restore
+  current_creds="$(sanitize_credentials_json "$current_creds")"
   current_config="$(sanitize_config_json "$current_config")"
 
   if [[ -n "$current_account" && "$current_account" != "null" && "$current_email" != "none" ]]; then
@@ -649,6 +687,9 @@ perform_switch() {
   target_creds="$(read_account_credentials "$target_account" "$target_email")"
   target_config="$(read_account_config "$target_account" "$target_email")"
   [[ -z "$target_creds" || -z "$target_config" ]] && { error "Missing backup data for Account-$target_account"; exit 1; }
+  # Defense-in-depth: sanitize target credentials before applying
+  # (handles old backups that may have been stored without sanitization)
+  target_creds="$(sanitize_credentials_json "$target_creds")"
 
   step "Applying target credentials/config..."
   write_credentials "$target_creds"
@@ -657,10 +698,15 @@ perform_switch() {
   oauth_section="$(printf '%s' "$target_config" | jq '.oauthAccount' 2>/dev/null || true)"
   [[ -z "$oauth_section" || "$oauth_section" == "null" ]] && { error "Invalid oauthAccount in backup"; exit 1; }
 
-  # IMPORTANT FIX: merge oauthAccount AND remove api-key settings to avoid auth conflict warning
+  # Merge oauthAccount from target and strip all API-key fields to avoid auth-conflict warning
   local merged_config
   merged_config="$(jq --argjson oauth "$oauth_section" '
-      del(.apiKeyHelper, .apiKey, .anthropicApiKey, .claudeApiKey, .managedApiKey, .externalApiKey)
+      del(
+        .apiKeyHelper, .apiKey, .anthropicApiKey, .claudeApiKey,
+        .managedApiKey, .externalApiKey,
+        .loginApiKey, .enterpriseApiKey, .organizationApiKey,
+        .apiKeySource, .hasApiKey
+      )
       | .oauthAccount = $oauth
     ' "$cfg_path" 2>/dev/null)"
   [[ $? -ne 0 || -z "$merged_config" ]] && { error "Failed to merge config"; exit 1; }
