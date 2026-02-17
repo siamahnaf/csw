@@ -3,7 +3,7 @@
 
 set -euo pipefail
 
-readonly CSW_VERSION="2.1.6"
+readonly CSW_VERSION="2.1.7"
 
 # Repo info (used for update checks)
 readonly CSW_REPO="siamahnaf/csw"
@@ -38,22 +38,10 @@ dimln()   { printf "%s%s%s\n"           "$DIM" "$*" "$RESET"; }
 # Container detection
 # -----------------------------
 is_running_in_container() {
-  if [[ -f /.dockerenv ]]; then
-    return 0
-  fi
-
-  if [[ -f /proc/1/cgroup ]] && grep -q 'docker\|lxc\|containerd\|kubepods' /proc/1/cgroup 2>/dev/null; then
-    return 0
-  fi
-
-  if [[ -f /proc/self/mountinfo ]] && grep -q 'docker\|overlay' /proc/self/mountinfo 2>/dev/null; then
-    return 0
-  fi
-
-  if [[ -n "${CONTAINER:-}" ]] || [[ -n "${container:-}" ]]; then
-    return 0
-  fi
-
+  [[ -f /.dockerenv ]] && return 0
+  [[ -f /proc/1/cgroup ]] && grep -q 'docker\|lxc\|containerd\|kubepods' /proc/1/cgroup 2>/dev/null && return 0
+  [[ -f /proc/self/mountinfo ]] && grep -q 'docker\|overlay' /proc/self/mountinfo 2>/dev/null && return 0
+  [[ -n "${CONTAINER:-}" ]] || [[ -n "${container:-}" ]] && return 0
   return 1
 }
 
@@ -64,11 +52,7 @@ detect_platform() {
   case "$(uname -s)" in
     Darwin) echo "macos" ;;
     Linux)
-      if [[ -n "${WSL_DISTRO_NAME:-}" ]]; then
-        echo "wsl"
-      else
-        echo "linux"
-      fi
+      if [[ -n "${WSL_DISTRO_NAME:-}" ]]; then echo "wsl"; else echo "linux"; fi
       ;;
     *) echo "unknown" ;;
   esac
@@ -87,7 +71,6 @@ get_claude_config_path() {
       return
     fi
   fi
-
   echo "$fallback_config"
 }
 
@@ -96,34 +79,23 @@ get_claude_config_path() {
 # -----------------------------
 validate_json() {
   local file="$1"
-  if ! jq . "$file" >/dev/null 2>&1; then
-    error "Invalid JSON in $file"
-    return 1
-  fi
+  jq . "$file" >/dev/null 2>&1 || { error "Invalid JSON in $file"; return 1; }
 }
 
 validate_email() {
   local email="$1"
-  if [[ "$email" =~ ^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$ ]]; then
-    return 0
-  fi
-  return 1
+  [[ "$email" =~ ^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$ ]]
 }
 
 write_json() {
-  local file="$1"
-  local content="$2"
-  local temp_file
-
+  local file="$1" content="$2" temp_file
   temp_file="$(mktemp "${file}.XXXXXX")"
   printf '%s\n' "$content" > "$temp_file"
-
   if ! jq . "$temp_file" >/dev/null 2>&1; then
     rm -f "$temp_file"
     error "Generated invalid JSON"
     return 1
   fi
-
   mv "$temp_file" "$file"
   chmod 600 "$file"
 }
@@ -131,19 +103,30 @@ write_json() {
 resolve_account_identifier() {
   local identifier="$1"
 
-  if [[ "$identifier" =~ ^[0-9]+$ ]]; then
-    echo "$identifier"
-    return 0
-  fi
-
-  if [[ ! -f "$SEQUENCE_FILE" ]]; then
-    echo ""
-    return 0
-  fi
+  [[ "$identifier" =~ ^[0-9]+$ ]] && { echo "$identifier"; return 0; }
+  [[ ! -f "$SEQUENCE_FILE" ]] && { echo ""; return 0; }
 
   jq -r --arg email "$identifier" '
     (.accounts | to_entries[]? | select(.value.email == $email) | .key) // empty
   ' "$SEQUENCE_FILE" 2>/dev/null | head -n 1
+}
+
+# Remove API-key-related settings so OAuth switching doesn't conflict.
+# (Fixes "Auth conflict: token + /login managed key")
+sanitize_config_json() {
+  local json="$1"
+  # We delete common key/helper fields. Safe if absent.
+  # Keep it permissive (doesn't break older/newer configs).
+  printf '%s' "$json" | jq '
+    del(
+      .apiKeyHelper,
+      .apiKey,
+      .anthropicApiKey,
+      .claudeApiKey,
+      .managedApiKey,
+      .externalApiKey
+    )
+  ' 2>/dev/null || printf '%s' "$json"
 }
 
 # -----------------------------
@@ -151,14 +134,11 @@ resolve_account_identifier() {
 # -----------------------------
 check_dependencies() {
   for cmd in jq curl; do
-    if ! command -v "$cmd" >/dev/null 2>&1; then
+    command -v "$cmd" >/dev/null 2>&1 || {
       error "Required command '$cmd' not found."
-      if [[ "$cmd" == "jq" ]]; then
-        dimln "  macOS: brew install jq"
-        dimln "  Ubuntu/Debian: sudo apt-get install -y jq"
-      fi
+      [[ "$cmd" == "jq" ]] && { dimln "  macOS: brew install jq"; dimln "  Ubuntu/Debian: sudo apt-get install -y jq"; }
       exit 1
-    fi
+    }
   done
 }
 
@@ -170,7 +150,6 @@ _strip_v_prefix() { echo "${1#v}"; }
 _semver_gt() {
   local a="$(_strip_v_prefix "$1")"
   local b="$(_strip_v_prefix "$2")"
-
   awk -v a="$a" -v b="$b" '
     function n(x){ return (x==""?0:x)+0 }
     BEGIN{
@@ -194,16 +173,9 @@ _get_latest_release_tag() {
 _check_update_available() {
   local tag latest
   tag="$(_get_latest_release_tag)"
-  if [[ -z "${tag:-}" ]]; then
-    return 2
-  fi
+  [[ -z "${tag:-}" ]] && return 2
   latest="$(_strip_v_prefix "$tag")"
-
-  if _semver_gt "$latest" "$CSW_VERSION"; then
-    echo "$latest"
-    return 0
-  fi
-
+  _semver_gt "$latest" "$CSW_VERSION" && { echo "$latest"; return 0; }
   return 1
 }
 
@@ -250,7 +222,6 @@ _install_from_tarball() {
 
   cp -f "$repo_dir/ccswitch.sh" "$lib_dir/ccswitch.sh"
   cp -f "$repo_dir/bin/csw" "$bin_dir/csw"
-
   chmod +x "$lib_dir/ccswitch.sh" "$bin_dir/csw"
 
   success "Installed/updated: $bin_dir/csw"
@@ -297,17 +268,10 @@ is_claude_running() {
 }
 
 wait_for_claude_close() {
-  if ! is_claude_running; then
-    return 0
-  fi
-
+  if ! is_claude_running; then return 0; fi
   warn "Claude Code is running. Please close it first."
   info "Waiting for Claude Code to close..."
-
-  while is_claude_running; do
-    sleep 1
-  done
-
+  while is_claude_running; do sleep 1; done
   success "Claude Code closed. Continuing..."
 }
 
@@ -315,29 +279,18 @@ wait_for_claude_close() {
 # Current account
 # -----------------------------
 get_current_account() {
-  local cfg
-  cfg="$(get_claude_config_path)"
-
-  if [[ ! -f "$cfg" ]]; then
-    echo "none"
-    return 0
-  fi
-
-  if ! validate_json "$cfg"; then
-    echo "none"
-    return 0
-  fi
-
+  local cfg; cfg="$(get_claude_config_path)"
+  [[ ! -f "$cfg" ]] && { echo "none"; return 0; }
+  validate_json "$cfg" || { echo "none"; return 0; }
   local email
   email="$(jq -r '.oauthAccount.emailAddress // empty' "$cfg" 2>/dev/null || true)"
   echo "${email:-none}"
 }
 
 # -----------------------------
-# FIX: macOS Keychain credential service mismatch
+# FIX: macOS Keychain credential service mismatch (space-safe)
 # -----------------------------
 _keychain_services() {
-  # Important: one service per line (names contain spaces)
   printf '%s\n' "Claude Code-credentials" "Claude Code"
 }
 
@@ -347,8 +300,7 @@ _keychain_read_service() {
 }
 
 _keychain_write_service() {
-  local service="$1"
-  local payload="$2"
+  local service="$1" payload="$2"
   security add-generic-password -U -s "$service" -a "$USER" -w "$payload" 2>/dev/null
 }
 
@@ -356,58 +308,38 @@ _keychain_write_service() {
 # Credentials I/O
 # -----------------------------
 read_credentials() {
-  local platform
-  platform="$(detect_platform)"
-
+  local platform; platform="$(detect_platform)"
   case "$platform" in
     macos)
       local best="" payload="" service=""
-      # Read line-by-line so spaces in service names are preserved
       while IFS= read -r service; do
         payload="$(_keychain_read_service "$service")"
         [[ -z "$payload" ]] && continue
-
-        # Prefer one with refreshToken present
         if printf '%s' "$payload" | jq -e '.claudeAiOauth.refreshToken? // empty | length > 0' >/dev/null 2>&1; then
-          best="$payload"
-          break
+          best="$payload"; break
         fi
-
-        # Fallback: any valid JSON
         if [[ -z "$best" ]] && printf '%s' "$payload" | jq -e . >/dev/null 2>&1; then
           best="$payload"
         fi
       done < <(_keychain_services)
-
       printf '%s' "$best"
       ;;
     linux|wsl)
-      if [[ -f "$HOME/.claude/.credentials.json" ]]; then
-        cat "$HOME/.claude/.credentials.json"
-      else
-        echo ""
-      fi
+      [[ -f "$HOME/.claude/.credentials.json" ]] && cat "$HOME/.claude/.credentials.json" || echo ""
       ;;
-    *)
-      echo ""
-      ;;
+    *) echo "" ;;
   esac
 }
 
 write_credentials() {
   local credentials="$1"
-  local platform
-  platform="$(detect_platform)"
-
+  local platform; platform="$(detect_platform)"
   case "$platform" in
     macos)
-      # Validate JSON before writing
       if ! printf '%s' "$credentials" | jq -e . >/dev/null 2>&1; then
         error "Refusing to write invalid JSON credentials to Keychain"
         return 1
       fi
-
-      # Write to BOTH services (line-by-line; preserve spaces)
       local service=""
       while IFS= read -r service; do
         _keychain_write_service "$service" "$credentials"
@@ -422,36 +354,21 @@ write_credentials() {
 }
 
 read_account_credentials() {
-  local account_num="$1"
-  local email="$2"
-  local platform
-  platform="$(detect_platform)"
-
+  local account_num="$1" email="$2"
+  local platform; platform="$(detect_platform)"
   case "$platform" in
-    macos)
-      security find-generic-password -s "Claude Code-Account-${account_num}-${email}" -w 2>/dev/null || echo ""
-      ;;
+    macos) security find-generic-password -s "Claude Code-Account-${account_num}-${email}" -w 2>/dev/null || echo "" ;;
     linux|wsl)
       local cred_file="$BACKUP_DIR/credentials/.claude-credentials-${account_num}-${email}.json"
-      if [[ -f "$cred_file" ]]; then
-        cat "$cred_file"
-      else
-        echo ""
-      fi
+      [[ -f "$cred_file" ]] && cat "$cred_file" || echo ""
       ;;
-    *)
-      echo ""
-      ;;
+    *) echo "" ;;
   esac
 }
 
 write_account_credentials() {
-  local account_num="$1"
-  local email="$2"
-  local credentials="$3"
-  local platform
-  platform="$(detect_platform)"
-
+  local account_num="$1" email="$2" credentials="$3"
+  local platform; platform="$(detect_platform)"
   case "$platform" in
     macos)
       if ! printf '%s' "$credentials" | jq -e . >/dev/null 2>&1; then
@@ -469,23 +386,14 @@ write_account_credentials() {
 }
 
 read_account_config() {
-  local account_num="$1"
-  local email="$2"
+  local account_num="$1" email="$2"
   local config_file="$BACKUP_DIR/configs/.claude-config-${account_num}-${email}.json"
-
-  if [[ -f "$config_file" ]]; then
-    cat "$config_file"
-  else
-    echo ""
-  fi
+  [[ -f "$config_file" ]] && cat "$config_file" || echo ""
 }
 
 write_account_config() {
-  local account_num="$1"
-  local email="$2"
-  local config="$3"
+  local account_num="$1" email="$2" config="$3"
   local config_file="$BACKUP_DIR/configs/.claude-config-${account_num}-${email}.json"
-
   printf '%s\n' "$config" > "$config_file"
   chmod 600 "$config_file"
 }
@@ -495,34 +403,24 @@ write_account_config() {
 # -----------------------------
 init_sequence_file() {
   if [[ ! -f "$SEQUENCE_FILE" ]]; then
-    local now
-    now="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
-    local init_content
-    init_content='{
+    local now; now="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+    write_json "$SEQUENCE_FILE" '{
   "activeAccountNumber": null,
   "lastUpdated": "'"$now"'",
   "sequence": [],
   "accounts": {}
 }'
-    write_json "$SEQUENCE_FILE" "$init_content"
   fi
 }
 
 get_next_account_number() {
-  if [[ ! -f "$SEQUENCE_FILE" ]]; then
-    echo "1"
-    return 0
-  fi
-
+  [[ ! -f "$SEQUENCE_FILE" ]] && { echo "1"; return 0; }
   jq -r '(.accounts | keys | map(tonumber) | max // 0) + 1' "$SEQUENCE_FILE"
 }
 
 account_exists() {
   local email="$1"
-  if [[ ! -f "$SEQUENCE_FILE" ]]; then
-    return 1
-  fi
-
+  [[ ! -f "$SEQUENCE_FILE" ]] && return 1
   jq -e --arg email "$email" '.accounts | to_entries[]? | select(.value.email == $email) | .key' \
     "$SEQUENCE_FILE" >/dev/null 2>&1
 }
@@ -534,33 +432,25 @@ cmd_add_account() {
   setup_directories
   init_sequence_file
 
-  local current_email
-  current_email="$(get_current_account)"
-
-  if [[ "$current_email" == "none" ]]; then
-    error "No active Claude account found. Please log in first."
-    exit 1
-  fi
+  local current_email; current_email="$(get_current_account)"
+  [[ "$current_email" == "none" ]] && { error "No active Claude account found. Please log in first."; exit 1; }
 
   if account_exists "$current_email"; then
     warn "Account $current_email is already managed."
     exit 0
   fi
 
-  local account_num
-  account_num="$(get_next_account_number)"
-
-  local cfg_path
-  cfg_path="$(get_claude_config_path)"
+  local account_num; account_num="$(get_next_account_number)"
+  local cfg_path; cfg_path="$(get_claude_config_path)"
 
   local current_creds current_config
   current_creds="$(read_credentials)"
   current_config="$(cat "$cfg_path")"
 
-  if [[ -z "$current_creds" ]]; then
-    error "No credentials found/readable for current account (Keychain service mismatch or permissions)."
-    exit 1
-  fi
+  [[ -z "$current_creds" ]] && { error "No credentials found/readable for current account (Keychain service mismatch or permissions)."; exit 1; }
+
+  # sanitize config before storing backup (prevents auth conflict later)
+  current_config="$(sanitize_config_json "$current_config")"
 
   local account_uuid
   account_uuid="$(jq -r '.oauthAccount.accountUuid' "$cfg_path")"
@@ -568,92 +458,51 @@ cmd_add_account() {
   write_account_credentials "$account_num" "$current_email" "$current_creds"
   write_account_config "$account_num" "$current_email" "$current_config"
 
-  local now
-  now="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
-
+  local now; now="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
   local updated
-  updated="$(jq --arg num "$account_num" \
-                --arg email "$current_email" \
-                --arg uuid "$account_uuid" \
-                --arg now "$now" '
+  updated="$(jq --arg num "$account_num" --arg email "$current_email" --arg uuid "$account_uuid" --arg now "$now" '
     .accounts[$num] = { email: $email, uuid: $uuid, added: $now }
     | .sequence += [($num|tonumber)]
     | .activeAccountNumber = ($num|tonumber)
     | .lastUpdated = $now
   ' "$SEQUENCE_FILE")"
-
   write_json "$SEQUENCE_FILE" "$updated"
   success "Added Account $account_num: $current_email"
 }
 
 cmd_remove_account() {
-  if [[ $# -eq 0 ]]; then
-    error "Usage: $0 --remove-account <account_number|email>"
-    exit 1
-  fi
+  if [[ $# -eq 0 ]]; then error "Usage: $0 --remove-account <account_number|email>"; exit 1; fi
+  [[ ! -f "$SEQUENCE_FILE" ]] && { error "No accounts are managed yet"; exit 1; }
 
-  if [[ ! -f "$SEQUENCE_FILE" ]]; then
-    error "No accounts are managed yet"
-    exit 1
-  fi
-
-  local identifier="$1"
-  local account_num
-
+  local identifier="$1" account_num
   if [[ "$identifier" =~ ^[0-9]+$ ]]; then
     account_num="$identifier"
   else
-    if ! validate_email "$identifier"; then
-      error "Invalid email format: $identifier"
-      exit 1
-    fi
+    validate_email "$identifier" || { error "Invalid email format: $identifier"; exit 1; }
     account_num="$(resolve_account_identifier "$identifier")"
-    if [[ -z "$account_num" ]]; then
-      error "No account found with email: $identifier"
-      exit 1
-    fi
+    [[ -z "$account_num" ]] && { error "No account found with email: $identifier"; exit 1; }
   fi
 
-  local account_info
-  account_info="$(jq -r --arg num "$account_num" '.accounts[$num] // empty' "$SEQUENCE_FILE")"
-  if [[ -z "$account_info" ]]; then
-    error "Account-$account_num does not exist"
-    exit 1
-  fi
+  local account_info; account_info="$(jq -r --arg num "$account_num" '.accounts[$num] // empty' "$SEQUENCE_FILE")"
+  [[ -z "$account_info" ]] && { error "Account-$account_num does not exist"; exit 1; }
 
-  local email
-  email="$(printf '%s' "$account_info" | jq -r '.email')"
-
-  local active_account
-  active_account="$(jq -r '.activeAccountNumber' "$SEQUENCE_FILE")"
-  if [[ "$active_account" == "$account_num" ]]; then
-    warn "Account-$account_num ($email) is currently active"
-  fi
+  local email; email="$(printf '%s' "$account_info" | jq -r '.email')"
+  local active_account; active_account="$(jq -r '.activeAccountNumber' "$SEQUENCE_FILE")"
+  [[ "$active_account" == "$account_num" ]] && warn "Account-$account_num ($email) is currently active"
 
   printf "%s%sAre you sure you want to permanently remove Account-%s (%s)?%s [y/N] " \
     "$YELLOW" "$BOLD" "$account_num" "$email" "$RESET"
-  local confirm
-  read -r confirm
-  if [[ "$confirm" != "y" && "$confirm" != "Y" ]]; then
-    warn "Cancelled"
-    exit 0
-  fi
+  local confirm; read -r confirm
+  [[ "$confirm" != "y" && "$confirm" != "Y" ]] && { warn "Cancelled"; exit 0; }
 
-  local platform
-  platform="$(detect_platform)"
+  local platform; platform="$(detect_platform)"
   case "$platform" in
-    macos)
-      security delete-generic-password -s "Claude Code-Account-${account_num}-${email}" 2>/dev/null || true
-      ;;
-    linux|wsl)
-      rm -f "$BACKUP_DIR/credentials/.claude-credentials-${account_num}-${email}.json"
-      ;;
+    macos) security delete-generic-password -s "Claude Code-Account-${account_num}-${email}" 2>/dev/null || true ;;
+    linux|wsl) rm -f "$BACKUP_DIR/credentials/.claude-credentials-${account_num}-${email}.json" ;;
   esac
   rm -f "$BACKUP_DIR/configs/.claude-config-${account_num}-${email}.json"
 
-  local now
-  now="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
-
+  local now; now="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
   local updated
   updated="$(jq --arg num "$account_num" --arg now "$now" '
     del(.accounts[$num])
@@ -661,23 +510,17 @@ cmd_remove_account() {
     | .lastUpdated = $now
     | if .activeAccountNumber == ($num|tonumber) then .activeAccountNumber = null else . end
   ' "$SEQUENCE_FILE")"
-
   write_json "$SEQUENCE_FILE" "$updated"
   success "Account-$account_num ($email) has been removed"
 }
 
 first_run_setup() {
-  local current_email
-  current_email="$(get_current_account)"
-  if [[ "$current_email" == "none" ]]; then
-    error "No active Claude account found. Please log in first."
-    return 1
-  fi
+  local current_email; current_email="$(get_current_account)"
+  [[ "$current_email" == "none" ]] && { error "No active Claude account found. Please log in first."; return 1; }
 
   printf "%s%sNo managed accounts found.%s Add current account (%s) to managed list? [Y/n] %s" \
     "$CYAN" "$BOLD" "$RESET" "$current_email" "$RESET"
-  local response
-  read -r response
+  local response; read -r response
   if [[ "$response" == "n" || "$response" == "N" ]]; then
     warn "Setup cancelled. You can run '$0 --add-account' later."
     return 1
@@ -694,9 +537,7 @@ cmd_list() {
     exit 0
   fi
 
-  local current_email
-  current_email="$(get_current_account)"
-
+  local current_email; current_email="$(get_current_account)"
   local active_account_num=""
   if [[ "$current_email" != "none" ]]; then
     active_account_num="$(jq -r --arg email "$current_email" '
@@ -731,84 +572,48 @@ get_next_in_sequence() {
 }
 
 cmd_switch() {
-  if [[ ! -f "$SEQUENCE_FILE" ]]; then
-    error "No accounts are managed yet"
-    exit 1
-  fi
+  [[ ! -f "$SEQUENCE_FILE" ]] && { error "No accounts are managed yet"; exit 1; }
 
-  local current_email
-  current_email="$(get_current_account)"
-  if [[ "$current_email" == "none" ]]; then
-    error "No active Claude account found"
-    exit 1
-  fi
+  local current_email; current_email="$(get_current_account)"
+  [[ "$current_email" == "none" ]] && { error "No active Claude account found"; exit 1; }
 
   if ! account_exists "$current_email"; then
     warn "Active account '$current_email' was not managed."
     info "Adding it automatically..."
     cmd_add_account
-    local account_num
-    account_num="$(jq -r '.activeAccountNumber' "$SEQUENCE_FILE")"
+    local account_num; account_num="$(jq -r '.activeAccountNumber' "$SEQUENCE_FILE")"
     success "Added as Account-$account_num."
     info "Please run '$0 --switch' again to switch to the next account."
     exit 0
   fi
 
-  local next_account
-  next_account="$(get_next_in_sequence)"
-  if [[ -z "$next_account" ]]; then
-    error "No accounts in sequence."
-    exit 1
-  fi
-
+  local next_account; next_account="$(get_next_in_sequence)"
+  [[ -z "$next_account" ]] && { error "No accounts in sequence."; exit 1; }
   perform_switch "$next_account"
 }
 
 cmd_switch_to() {
-  if [[ $# -eq 0 ]]; then
-    error "Usage: $0 --switch-to <account_number|email>"
-    exit 1
-  fi
+  [[ $# -eq 0 ]] && { error "Usage: $0 --switch-to <account_number|email>"; exit 1; }
+  [[ ! -f "$SEQUENCE_FILE" ]] && { error "No accounts are managed yet"; exit 1; }
 
-  if [[ ! -f "$SEQUENCE_FILE" ]]; then
-    error "No accounts are managed yet"
-    exit 1
-  fi
-
-  local identifier="$1"
-  local target_account
-
+  local identifier="$1" target_account
   if [[ "$identifier" =~ ^[0-9]+$ ]]; then
     target_account="$identifier"
   else
-    if ! validate_email "$identifier"; then
-      error "Invalid email format: $identifier"
-      exit 1
-    fi
+    validate_email "$identifier" || { error "Invalid email format: $identifier"; exit 1; }
     target_account="$(resolve_account_identifier "$identifier")"
-    if [[ -z "$target_account" ]]; then
-      error "No account found with email: $identifier"
-      exit 1
-    fi
+    [[ -z "$target_account" ]] && { error "No account found with email: $identifier"; exit 1; }
   fi
 
-  local account_info
-  account_info="$(jq -r --arg num "$target_account" '.accounts[$num] // empty' "$SEQUENCE_FILE")"
-  if [[ -z "$account_info" ]]; then
-    error "Account-$target_account does not exist"
-    exit 1
-  fi
+  local account_info; account_info="$(jq -r --arg num "$target_account" '.accounts[$num] // empty' "$SEQUENCE_FILE")"
+  [[ -z "$account_info" ]] && { error "Account-$target_account does not exist"; exit 1; }
 
   perform_switch "$target_account"
 }
 
 get_current_managed_account_num() {
   local email="$1"
-  if [[ "$email" == "none" || ! -f "$SEQUENCE_FILE" ]]; then
-    echo ""
-    return 0
-  fi
-
+  [[ "$email" == "none" || ! -f "$SEQUENCE_FILE" ]] && { echo ""; return 0; }
   jq -r --arg email "$email" '
     (.accounts | to_entries[]? | select(.value.email == $email) | .key) // empty
   ' "$SEQUENCE_FILE" 2>/dev/null | head -n 1
@@ -816,39 +621,26 @@ get_current_managed_account_num() {
 
 perform_switch() {
   local target_account="$1"
-
   wait_for_claude_close
 
   local target_email
   target_email="$(jq -r --arg num "$target_account" '.accounts[$num].email // empty' "$SEQUENCE_FILE")"
-  if [[ -z "$target_email" ]]; then
-    error "Could not resolve target account email."
-    exit 1
-  fi
+  [[ -z "$target_email" ]] && { error "Could not resolve target account email."; exit 1; }
 
-  local current_email
-  current_email="$(get_current_account)"
+  local current_email; current_email="$(get_current_account)"
+  local current_account; current_account="$(get_current_managed_account_num "$current_email")"
+  [[ -z "$current_account" ]] && current_account="$(jq -r '.activeAccountNumber // empty' "$SEQUENCE_FILE")"
 
-  local current_account
-  current_account="$(get_current_managed_account_num "$current_email")"
-  if [[ -z "$current_account" ]]; then
-    current_account="$(jq -r '.activeAccountNumber // empty' "$SEQUENCE_FILE")"
-  fi
-
-  local cfg_path
-  cfg_path="$(get_claude_config_path)"
-
+  local cfg_path; cfg_path="$(get_claude_config_path)"
   local current_creds current_config
   current_creds="$(read_credentials)"
   current_config="$(cat "$cfg_path")"
+  current_config="$(sanitize_config_json "$current_config")"
 
   if [[ -n "$current_account" && "$current_account" != "null" && "$current_email" != "none" ]]; then
     step "Saving current account backup..."
-    if [[ -n "$current_creds" ]]; then
-      write_account_credentials "$current_account" "$current_email" "$current_creds"
-    else
-      warn "Could not read current credentials; skipping credentials backup."
-    fi
+    [[ -n "$current_creds" ]] && write_account_credentials "$current_account" "$current_email" "$current_creds" \
+      || warn "Could not read current credentials; skipping credentials backup."
     write_account_config "$current_account" "$current_email" "$current_config"
     success "Backed up: Account-$current_account ($current_email)"
   fi
@@ -856,40 +648,31 @@ perform_switch() {
   local target_creds target_config
   target_creds="$(read_account_credentials "$target_account" "$target_email")"
   target_config="$(read_account_config "$target_account" "$target_email")"
-
-  if [[ -z "$target_creds" || -z "$target_config" ]]; then
-    error "Missing backup data for Account-$target_account"
-    exit 1
-  fi
+  [[ -z "$target_creds" || -z "$target_config" ]] && { error "Missing backup data for Account-$target_account"; exit 1; }
 
   step "Applying target credentials/config..."
   write_credentials "$target_creds"
 
   local oauth_section
   oauth_section="$(printf '%s' "$target_config" | jq '.oauthAccount' 2>/dev/null || true)"
-  if [[ -z "$oauth_section" || "$oauth_section" == "null" ]]; then
-    error "Invalid oauthAccount in backup"
-    exit 1
-  fi
+  [[ -z "$oauth_section" || "$oauth_section" == "null" ]] && { error "Invalid oauthAccount in backup"; exit 1; }
 
+  # IMPORTANT FIX: merge oauthAccount AND remove api-key settings to avoid auth conflict warning
   local merged_config
-  merged_config="$(jq --argjson oauth "$oauth_section" '.oauthAccount = $oauth' "$cfg_path" 2>/dev/null)"
-  if [[ $? -ne 0 || -z "$merged_config" ]]; then
-    error "Failed to merge config"
-    exit 1
-  fi
+  merged_config="$(jq --argjson oauth "$oauth_section" '
+      del(.apiKeyHelper, .apiKey, .anthropicApiKey, .claudeApiKey, .managedApiKey, .externalApiKey)
+      | .oauthAccount = $oauth
+    ' "$cfg_path" 2>/dev/null)"
+  [[ $? -ne 0 || -z "$merged_config" ]] && { error "Failed to merge config"; exit 1; }
 
   write_json "$cfg_path" "$merged_config"
 
-  local now
-  now="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
-
+  local now; now="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
   local updated
   updated="$(jq --arg num "$target_account" --arg now "$now" '
     .activeAccountNumber = ($num|tonumber)
     | .lastUpdated = $now
   ' "$SEQUENCE_FILE")"
-
   write_json "$SEQUENCE_FILE" "$updated"
 
   success "Switched to Account-$target_account ($target_email)"
@@ -924,49 +707,16 @@ main() {
   check_dependencies
 
   case "${1:-}" in
-  -v|--version|version)
-    success "csw version ${CSW_VERSION}"
-    ;;
-
-  -check-update|--check-update|check-update)
-    cmd_check_update
-    ;;
-
-  --update|update)
-    cmd_update
-    ;;
-
-  --add-account|add-account)
-    cmd_add_account
-    ;;
-
-  --remove-account|remove-account|rm-account)
-    shift
-    cmd_remove_account "$@"
-    ;;
-
-  --list|list|ls)
-    cmd_list
-    ;;
-
-  --switch|switch|next)
-    cmd_switch
-    ;;
-
-  --switch-to|switch-to|to)
-    shift
-    cmd_switch_to "$@"
-    ;;
-
-  --help|help|-h|"")
-    show_usage
-    ;;
-
-  *)
-    error "Unknown command '$1'"
-    show_usage
-    exit 1
-    ;;
+  -v|--version|version) success "csw version ${CSW_VERSION}" ;;
+  -check-update|--check-update|check-update) cmd_check_update ;;
+  --update|update) cmd_update ;;
+  --add-account|add-account) cmd_add_account ;;
+  --remove-account|remove-account|rm-account) shift; cmd_remove_account "$@" ;;
+  --list|list|ls) cmd_list ;;
+  --switch|switch|next) cmd_switch ;;
+  --switch-to|switch-to|to) shift; cmd_switch_to "$@" ;;
+  --help|help|-h|"") show_usage ;;
+  *) error "Unknown command '$1'"; show_usage; exit 1 ;;
   esac
 }
 
