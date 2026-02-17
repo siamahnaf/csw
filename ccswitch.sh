@@ -3,7 +3,7 @@
 
 set -euo pipefail
 
-readonly CSW_VERSION="2.1.5"
+readonly CSW_VERSION="2.1.6"
 
 # Repo info (used for update checks)
 readonly CSW_REPO="siamahnaf/csw"
@@ -165,12 +165,8 @@ check_dependencies() {
 # -----------------------------
 # Update helpers
 # -----------------------------
-_strip_v_prefix() {
-  # strips leading 'v' from tags like v1.2.3
-  echo "${1#v}"
-}
+_strip_v_prefix() { echo "${1#v}"; }
 
-# returns 0 if A > B, else 1
 _semver_gt() {
   local a="$(_strip_v_prefix "$1")"
   local b="$(_strip_v_prefix "$2")"
@@ -190,8 +186,6 @@ _semver_gt() {
 }
 
 _get_latest_release_tag() {
-  # Uses GitHub Releases API; returns "" if none
-  # NOTE: unauthenticated GitHub API has rate limits
   curl -fsSL "https://api.github.com/repos/${CSW_REPO}/releases/latest" 2>/dev/null \
     | jq -r '.tag_name // empty' 2>/dev/null \
     | head -n 1
@@ -201,7 +195,6 @@ _check_update_available() {
   local tag latest
   tag="$(_get_latest_release_tag)"
   if [[ -z "${tag:-}" ]]; then
-    # No releases found; cannot compare versions reliably
     return 2
   fi
   latest="$(_strip_v_prefix "$tag")"
@@ -223,20 +216,13 @@ cmd_check_update() {
   fi
 
   case "$?" in
-    1)
-      success "You are up to date: ${CSW_VERSION}"
-      return 0
-      ;;
+    1) success "You are up to date: ${CSW_VERSION}" ;;
     2)
       warn "No GitHub releases found for ${CSW_REPO}."
       info "Tip: create a release tag like v${CSW_VERSION} to enable update checking."
       info "You can still update from branch '${CSW_DEFAULT_BRANCH}' using: csw --update"
-      return 0
       ;;
-    *)
-      error "Could not check for updates (network/API issue)."
-      return 1
-      ;;
+    *) error "Could not check for updates (network/API issue)."; return 1 ;;
   esac
 }
 
@@ -256,7 +242,6 @@ _install_from_tarball() {
   curl -fsSL "$tarball_url" -o "$tmp/repo.tar.gz"
   tar -xzf "$tmp/repo.tar.gz" -C "$tmp"
 
-  # For tag tarballs: repo folder name is usually csw-<tag>
   repo_dir="$(find "$tmp" -maxdepth 1 -type d -name 'csw-*' | head -n 1)"
   if [[ -z "${repo_dir:-}" || ! -d "$repo_dir" ]]; then
     error "Could not locate extracted repo folder."
@@ -274,7 +259,6 @@ _install_from_tarball() {
 }
 
 cmd_update() {
-  # Prefer updating to latest GitHub Release if available; otherwise update from main branch.
   local tag latest tarball
 
   tag="$(_get_latest_release_tag)"
@@ -353,7 +337,7 @@ get_current_account() {
 # FIX: macOS Keychain credential service mismatch
 # -----------------------------
 _keychain_services() {
-  # Claude Code has been observed using either service name depending on build
+  # Important: one service per line (names contain spaces)
   printf '%s\n' "Claude Code-credentials" "Claude Code"
 }
 
@@ -377,22 +361,24 @@ read_credentials() {
 
   case "$platform" in
     macos)
-      # Prefer the entry that contains claudeAiOauth.refreshToken
-      local s payload best=""
-      for s in $(_keychain_services); do
-        payload="$(_keychain_read_service "$s")"
+      local best="" payload="" service=""
+      # Read line-by-line so spaces in service names are preserved
+      while IFS= read -r service; do
+        payload="$(_keychain_read_service "$service")"
         [[ -z "$payload" ]] && continue
 
+        # Prefer one with refreshToken present
         if printf '%s' "$payload" | jq -e '.claudeAiOauth.refreshToken? // empty | length > 0' >/dev/null 2>&1; then
           best="$payload"
           break
         fi
 
-        # fallback: any valid JSON
+        # Fallback: any valid JSON
         if [[ -z "$best" ]] && printf '%s' "$payload" | jq -e . >/dev/null 2>&1; then
           best="$payload"
         fi
-      done
+      done < <(_keychain_services)
+
       printf '%s' "$best"
       ;;
     linux|wsl)
@@ -415,17 +401,17 @@ write_credentials() {
 
   case "$platform" in
     macos)
-      # Validate JSON before writing; avoids storing empty garbage and breaking auth
+      # Validate JSON before writing
       if ! printf '%s' "$credentials" | jq -e . >/dev/null 2>&1; then
         error "Refusing to write invalid JSON credentials to Keychain"
         return 1
       fi
 
-      # Write to BOTH services so whichever Claude reads will be updated
-      local s
-      for s in $(_keychain_services); do
-        _keychain_write_service "$s" "$credentials"
-      done
+      # Write to BOTH services (line-by-line; preserve spaces)
+      local service=""
+      while IFS= read -r service; do
+        _keychain_write_service "$service" "$credentials"
+      done < <(_keychain_services)
       ;;
     linux|wsl)
       mkdir -p "$HOME/.claude"
@@ -468,7 +454,6 @@ write_account_credentials() {
 
   case "$platform" in
     macos)
-      # Validate before storing backups too
       if ! printf '%s' "$credentials" | jq -e . >/dev/null 2>&1; then
         error "Refusing to store invalid JSON in Keychain for Account-$account_num"
         return 1
@@ -832,7 +817,6 @@ get_current_managed_account_num() {
 perform_switch() {
   local target_account="$1"
 
-  # (Optional but recommended) avoid races while Claude is running
   wait_for_claude_close
 
   local target_email
@@ -863,7 +847,7 @@ perform_switch() {
     if [[ -n "$current_creds" ]]; then
       write_account_credentials "$current_account" "$current_email" "$current_creds"
     else
-      warn "Could not read current credentials; skipping credentials backup (config will still be saved)."
+      warn "Could not read current credentials; skipping credentials backup."
     fi
     write_account_config "$current_account" "$current_email" "$current_config"
     success "Backed up: Account-$current_account ($current_email)"
