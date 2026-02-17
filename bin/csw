@@ -5,10 +5,9 @@ PREFIX="${PREFIX:-$HOME/.local}"
 LIB="$PREFIX/share/csw/ccswitch.sh"
 
 if [[ ! -f "$LIB" ]]; then
-  echo "Error: csw is installed but missing: $LIB"
-  echo "Reinstall with:"
-  echo "  curl -fsSL https://raw.githubusercontent.com/siamahnaf/csw/main/install.sh | bash"
+  echo "[ERR] csw library not found: $LIB" >&2
+  echo "Reinstall: curl -fsSL https://raw.githubusercontent.com/siamahnaf/csw/main/install.sh | bash" >&2
   exit 1
 fi
 
-exec /bin/bash "$LIB" "$@"
+exec bash "$LIB" "$@"
