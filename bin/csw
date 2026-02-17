@@ -1,41 +1,14 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Prefer PREFIX only if it actually contains our library.
-DEFAULT_PREFIX="$HOME/.local"
-PREFIX_CANDIDATE="${PREFIX:-$DEFAULT_PREFIX}"
+PREFIX="${PREFIX:-$HOME/.local}"
+LIB="$PREFIX/share/csw/ccswitch.sh"
 
-try_lib() { [[ -f "$1" ]] && { echo "$1"; return 0; } return 1; }
-
-LIB=""
-# 1) PREFIX (if valid)
-LIB="$(try_lib "$PREFIX_CANDIDATE/share/csw/ccswitch.sh" || true)"
-
-# 2) Relative to this script (works even if PREFIX env is weird)
-if [[ -z "$LIB" ]]; then
-  SELF_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
-  LIB="$(try_lib "$SELF_DIR/../share/csw/ccswitch.sh" || true)"
-fi
-
-# 3) Common brew prefixes fallback
-if [[ -z "$LIB" ]]; then
-  for p in /opt/homebrew /usr/local "$DEFAULT_PREFIX"; do
-    LIB="$(try_lib "$p/share/csw/ccswitch.sh" || true)"
-    [[ -n "$LIB" ]] && break
-  done
-fi
-
-if [[ -z "$LIB" ]]; then
-  echo "[ERR] csw library not found." >&2
-  echo "Looked in:" >&2
-  echo "  ${PREFIX_CANDIDATE}/share/csw/ccswitch.sh" >&2
-  echo "  (relative) $(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)/../share/csw/ccswitch.sh" >&2
-  echo "  /opt/homebrew/share/csw/ccswitch.sh" >&2
-  echo "  /usr/local/share/csw/ccswitch.sh" >&2
-  echo "" >&2
-  echo "Reinstall:" >&2
-  echo "  curl -fsSL https://raw.githubusercontent.com/siamahnaf/csw/main/install.sh | bash" >&2
+if [[ ! -f "$LIB" ]]; then
+  echo "Error: csw is installed but missing: $LIB"
+  echo "Reinstall with:"
+  echo "  curl -fsSL https://raw.githubusercontent.com/siamahnaf/csw/main/install.sh | bash"
   exit 1
 fi
 
-exec /usr/bin/env bash "$LIB" "$@"
+exec /bin/bash "$LIB" "$@"

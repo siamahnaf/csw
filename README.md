@@ -4,175 +4,112 @@
   <img alt="Siam Ahnaf" src="https://raw.githubusercontent.com/siamahnaf/assets-kit/main/logo/logo-black.png" height="auto" width="240">
 </picture>
 
-# Multi-Account Switcher for Claude Code (csw)
+# Multi-Account Switcher for Claude Code
 
-`csw` is a powerful yet lightweight CLI tool to manage and switch between multiple Claude Code accounts on macOS, Linux, and WSL.
+`csw` is a lightweight CLI to **manage and switch between multiple Claude Code accounts** on **macOS, Linux, and WSL**.
 
-It swaps authentication only — your themes, preferences, chat history, and UI settings remain unchanged.
-
----
-
-## What's New (v2.1)
-
-### Interactive Mode
-Menu-driven interface for easier account management:
-
-    csw interactive
-
-### Color-Coded Output
-Beautiful, readable terminal output with structured formatting.
-
-Disable colors if needed:
-
-    csw --no-color
-
-### Progress Indicators
-Real-time spinner feedback during:
-- Switching accounts
-- Installing / Updating
-- Export / Import
-- Backup operations
-
----
-
-## Secure & Smart Authentication Handling
-
-Claude Code does not officially support account switching.
-
-`csw` works by safely:
-1. Backing up authentication credentials
-2. Swapping OAuth credentials when switching accounts
-3. Updating Claude config automatically
-
-### macOS Special Fix
-
-Claude Code sometimes stores credentials under different Keychain service names:
-
-- Claude Code
-- Claude Code-credentials
-
-`csw` automatically:
-- Detects which one contains valid OAuth tokens
-- Writes to both services to prevent 401 authentication errors
-
-This prevents the common:
-
-    Failed to authenticate. API Error: 401 OAuth token has expired
+It only switches **authentication** — your **themes, settings, preferences, and chat history** remain unchanged.
 
 ---
 
 ## Features
 
-- Multi-account management
-- Fast account rotation
-- Switch by number, email, or alias
-- Alias support
-- Backup verification
-- Export / Import accounts
-- Undo last switch
-- Switch history tracking
-- Interactive UI
-- Cross-platform (macOS, Linux, WSL)
-- Secure storage:
-  - macOS → Keychain
-  - Linux/WSL → restricted permission files
+- **Multi-account management**: add, remove, list accounts
+- **Fast switching**: rotate to the next account or switch to a specific one
+- **Cross-platform**: macOS, Linux, WSL
+- **Secure storage**
+  - **macOS**: credentials stored in **Keychain**
+  - **Linux/WSL**: credentials stored in local files with **restricted permissions**
+- **Non-destructive**: does not modify your Claude Code UI settings
 
 ---
 
 ## Installation
 
-### One-line install
+### Install with one command
 
-    curl -fsSL https://raw.githubusercontent.com/siamahnaf/csw/main/install.sh | bash
+```bash
+curl -fsSL https://raw.githubusercontent.com/siamahnaf/csw/main/install.sh | bash
+````
 
----
+### Ensure `csw` is on your PATH
 
-### Add to PATH (if needed)
+If `csw` is not found after install, add `~/.local/bin` to your shell PATH:
 
-zsh (macOS default):
+**zsh (default on macOS):**
 
-    echo 'export PATH="$HOME/.local/bin:$PATH"' >> ~/.zshrc
-    source ~/.zshrc
-    hash -r
+```bash
+echo 'export PATH="$HOME/.local/bin:$PATH"' >> ~/.zshrc
+source ~/.zshrc
+hash -r
+```
 
-bash:
+**bash:**
 
-    echo 'export PATH="$HOME/.local/bin:$PATH"' >> ~/.bashrc
-    source ~/.bashrc
-    hash -r
+```bash
+echo 'export PATH="$HOME/.local/bin:$PATH"' >> ~/.bashrc
+source ~/.bashrc
+hash -r
+```
 
 ---
 
 ## Usage
 
-Basic:
+### Basic commands
 
-    csw add-account
-    csw list
-    csw switch
-    csw switch-to 2
-    csw switch-to user@example.com
-    csw remove-account 2
-    csw status
-    csw verify
+```bash
+# Add the currently logged-in Claude Code account to managed accounts
+csw add-account
 
-Alias Support:
+# List all managed accounts
+csw list
 
-    csw set-alias 1 work
-    csw switch-to work
+# Switch to the next account in your rotation
+csw switch
 
-Sync Current Account (after re-login):
+# Switch to a specific account by number or email
+csw switch-to 2
+csw switch-to user2@example.com
 
-    csw sync
+# Remove an account (by number or email)
+csw remove-account 2
+csw remove-account user2@example.com
 
-Undo Last Switch:
+# Help
+csw -help
 
-    csw undo
-
-Export Accounts:
-
-    csw export backup.tar.gz
-
-Import Accounts:
-
-    csw import backup.tar.gz
+# Updater
+csw -v
+csw -check-update
+```
 
 ---
 
-## First-Time Setup Workflow
+## First-time setup workflow
 
-1. Log in to Claude Code with Account #1  
+1. **Log in to Claude Code** with your first account
 2. Run:
 
-       csw add-account
+   ```bash
+   csw add-account
+   ```
+3. **Log out**, then log in with your second account
+4. Run again:
 
-3. Log out → Log in with Account #2  
-4. Run:
+   ```bash
+   csw add-account
+   ```
+5. Switch accounts anytime:
 
-       csw add-account
+   ```bash
+   csw switch
+   ```
 
-5. Switch anytime:
+After switching, **restart Claude Code** to apply the new authentication.
 
-       csw switch
-
-After switching, restart Claude Code.
-
----
-
-## Verification & Health Check
-
-    csw verify
-
-- Checks if credentials exist
-- Warns if refreshToken is missing
-- Detects degraded accounts before 401 errors happen
-
-If login expires:
-1. Switch to that account
-2. Log in normally
-3. Run:
-
-       csw sync
+> **What gets switched:** only authentication credentials and OAuth account info.
+> **What stays the same:** themes, settings, preferences, and chat history.
 
 ---
 
