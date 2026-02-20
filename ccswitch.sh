@@ -3,7 +3,7 @@
 
 set -euo pipefail
 
-readonly CSW_VERSION="2.3.2"
+readonly CSW_VERSION="2.3.3"
 
 # Repo info (used for update checks)
 readonly CSW_REPO="siamahnaf/csw"
@@ -713,14 +713,18 @@ perform_switch() {
   # (handles old backups that may have been stored without sanitization)
   target_creds="$(sanitize_credentials_json "$target_creds")"
 
-  # Reset expiresAt so Claude Code treats the access token as expired and
-  # immediately uses the refreshToken to obtain a fresh accessToken on next
-  # startup.  Without this, a backed-up token that sat dormant for >1-2 hours
-  # will be sent to the API as-is, causing 401 "OAuth token has expired" errors
-  # even though the refreshToken is perfectly valid.
-  target_creds="$(printf '%s' "$target_creds" | jq -c '
-    if .claudeAiOauth then .claudeAiOauth.expiresAt = 0 else . end
-  ' 2>/dev/null || printf '%s' "$target_creds")"
+  # Reset expiresAt to 1 second in the past so Claude Code treats the access
+  # token as expired and immediately uses the refreshToken to obtain a fresh
+  # accessToken on next startup.  Without this, a backed-up token that sat
+  # dormant for >8 hours will be sent to the API as-is, causing 401 errors.
+  # NOTE: expiresAt must NOT be 0 — Claude Code treats 0 as "no credentials"
+  # and skips the refresh flow entirely, causing an instant 401 on every switch.
+  local past_exp
+  past_exp="$(( $(date +%s) * 1000 - 1000 ))"
+  target_creds="$(printf '%s' "$target_creds" | jq -c \
+    --argjson exp "$past_exp" '
+      if .claudeAiOauth then .claudeAiOauth.expiresAt = $exp else . end
+    ' 2>/dev/null || printf '%s' "$target_creds")"
 
   step "Applying target credentials/config..."
   write_credentials "$target_creds"
