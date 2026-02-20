@@ -3,7 +3,7 @@
 
 set -euo pipefail
 
-readonly CSW_VERSION="2.3.3"
+readonly CSW_VERSION="2.3.4"
 
 # Repo info (used for update checks)
 readonly CSW_REPO="siamahnaf/csw"
@@ -152,6 +152,62 @@ sanitize_credentials_json() {
       .loginApiKey
     )
   ' 2>/dev/null || printf '%s' "$json"
+}
+
+# Proactively refresh the OAuth access token using the stored refreshToken.
+# On success returns updated credentials JSON with a fresh accessToken, expiresAt,
+# and (if the server rotates tokens) a new refreshToken.
+# On ANY failure (network error, expired refresh token, bad response, etc.) the
+# original credentials are returned unchanged — the caller falls back gracefully.
+refresh_oauth_token() {
+  local creds="$1"
+  local refresh_token
+  refresh_token="$(printf '%s' "$creds" | jq -r '.claudeAiOauth.refreshToken // empty' 2>/dev/null)"
+  [[ -z "$refresh_token" ]] && { printf '%s' "$creds"; return 0; }
+
+  local tmp_body http_code
+  tmp_body="$(mktemp)"
+  http_code="$(curl -s -o "$tmp_body" -w '%{http_code}' \
+    --max-time 15 \
+    -X POST "https://platform.claude.com/v1/oauth/token" \
+    -H "Content-Type: application/x-www-form-urlencoded" \
+    -H "anthropic-beta: oauth-2025-04-20" \
+    --data-urlencode "grant_type=refresh_token" \
+    --data-urlencode "refresh_token=$refresh_token" \
+    --data-urlencode "client_id=9d1c250a-e61b-44d9-88ed-5944d1962f5e" \
+    2>/dev/null)" || { rm -f "$tmp_body"; printf '%s' "$creds"; return 0; }
+
+  local body
+  body="$(cat "$tmp_body")"
+  rm -f "$tmp_body"
+
+  [[ "$http_code" != "200" ]] && { printf '%s' "$creds"; return 0; }
+
+  local access_token expires_in new_refresh_token
+  access_token="$(printf '%s' "$body" | jq -r '.access_token // empty' 2>/dev/null)"
+  expires_in="$(printf '%s' "$body" | jq -r '.expires_in // 28800' 2>/dev/null)"
+  new_refresh_token="$(printf '%s' "$body" | jq -r '.refresh_token // empty' 2>/dev/null)"
+
+  [[ -z "$access_token" ]] && { printf '%s' "$creds"; return 0; }
+
+  local expires_at
+  expires_at="$(( $(date +%s) * 1000 + expires_in * 1000 ))"
+  # Keep old refresh token if server didn't issue a new one (non-rotating flow)
+  [[ -z "$new_refresh_token" ]] && new_refresh_token="$refresh_token"
+
+  local updated_creds
+  updated_creds="$(printf '%s' "$creds" | jq -c \
+    --arg  at "$access_token" \
+    --argjson ea "$expires_at" \
+    --arg  rt "$new_refresh_token" '
+      if .claudeAiOauth then
+        .claudeAiOauth.accessToken  = $at
+        | .claudeAiOauth.expiresAt  = $ea
+        | .claudeAiOauth.refreshToken = $rt
+      else . end
+    ' 2>/dev/null)" || { printf '%s' "$creds"; return 0; }
+
+  printf '%s' "$updated_creds"
 }
 
 # -----------------------------
@@ -713,18 +769,20 @@ perform_switch() {
   # (handles old backups that may have been stored without sanitization)
   target_creds="$(sanitize_credentials_json "$target_creds")"
 
-  # Reset expiresAt to 1 second in the past so Claude Code treats the access
-  # token as expired and immediately uses the refreshToken to obtain a fresh
-  # accessToken on next startup.  Without this, a backed-up token that sat
-  # dormant for >8 hours will be sent to the API as-is, causing 401 errors.
-  # NOTE: expiresAt must NOT be 0 — Claude Code treats 0 as "no credentials"
-  # and skips the refresh flow entirely, causing an instant 401 on every switch.
-  local past_exp
-  past_exp="$(( $(date +%s) * 1000 - 1000 ))"
-  target_creds="$(printf '%s' "$target_creds" | jq -c \
-    --argjson exp "$past_exp" '
-      if .claudeAiOauth then .claudeAiOauth.expiresAt = $exp else . end
-    ' 2>/dev/null || printf '%s' "$target_creds")"
+  # Proactively refresh the OAuth token so restored credentials are always
+  # current regardless of how long ago this account was last used.
+  # If the refresh succeeds the new accessToken/expiresAt/refreshToken are
+  # used; if it fails for any reason the stored credentials are used as-is
+  # (same behaviour as before — works until the stored accessToken expires).
+  step "Refreshing OAuth token for Account-$target_account..."
+  local refreshed_creds
+  refreshed_creds="$(refresh_oauth_token "$target_creds")"
+  if [[ "$refreshed_creds" != "$target_creds" ]]; then
+    target_creds="$refreshed_creds"
+    success "Token refreshed."
+  else
+    warn "Token refresh skipped (no network or stored token already valid)."
+  fi
 
   step "Applying target credentials/config..."
   write_credentials "$target_creds"
