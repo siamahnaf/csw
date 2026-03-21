@@ -3,7 +3,7 @@
 
 set -euo pipefail
 
-readonly CSW_VERSION="2.4.2"
+readonly CSW_VERSION="2.4.4"
 
 # Repo info (used for update checks)
 readonly CSW_REPO="siamahnaf/csw"
@@ -12,6 +12,7 @@ readonly CSW_DEFAULT_BRANCH="main"
 # Configuration
 readonly BACKUP_DIR="$HOME/.claude-switch-backup"
 readonly SEQUENCE_FILE="$BACKUP_DIR/sequence.json"
+readonly _BG_REFRESH_PID_FILE="$BACKUP_DIR/.bg-refresh.pid"
 
 # -----------------------------
 # Colors / Styled output
@@ -173,7 +174,7 @@ refresh_oauth_token() {
   fi
 
   local tmp_body http_code body
-  local _retry_count=0 _max_retries=3 _backoff=2
+  local _retry_count=0 _max_retries=3 _backoff=5
 
   while true; do
     tmp_body="$(mktemp)"
@@ -832,8 +833,21 @@ get_current_managed_account_num() {
   ' "$SEQUENCE_FILE" 2>/dev/null | head -n 1
 }
 
+_kill_bg_refresh() {
+  if [[ -f "$_BG_REFRESH_PID_FILE" ]]; then
+    local old_pid
+    old_pid="$(cat "$_BG_REFRESH_PID_FILE" 2>/dev/null)"
+    if [[ -n "$old_pid" ]] && kill -0 "$old_pid" 2>/dev/null; then
+      kill "$old_pid" 2>/dev/null || true
+      wait "$old_pid" 2>/dev/null || true
+    fi
+    rm -f "$_BG_REFRESH_PID_FILE"
+  fi
+}
+
 perform_switch() {
   local target_account="$1"
+  _kill_bg_refresh
   wait_for_claude_close
 
   local target_email
@@ -939,6 +953,7 @@ perform_switch() {
   # Refresh all other dormant accounts in the background so their tokens
   # stay alive. This runs silently — failures are non-blocking.
   _refresh_dormant_accounts "$target_account" &
+  echo "$!" > "$_BG_REFRESH_PID_FILE"
 }
 
 _refresh_dormant_accounts() {
@@ -948,7 +963,7 @@ _refresh_dormant_accounts() {
   # Use a private status file so we don't race with the foreground process
   _REFRESH_STATUS_FILE="$(mktemp 2>/dev/null || echo "/tmp/.csw-refresh-bg-$$")"
   # shellcheck disable=SC2064
-  trap "rm -f \"$_REFRESH_STATUS_FILE\"" EXIT
+  trap "rm -f \"$_REFRESH_STATUS_FILE\" \"$_BG_REFRESH_PID_FILE\"" EXIT
 
   local account_nums
   account_nums="$(jq -r '.sequence[]?' "$SEQUENCE_FILE")"
