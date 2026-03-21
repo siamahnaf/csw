@@ -3,7 +3,7 @@
 
 set -euo pipefail
 
-readonly CSW_VERSION="2.3.4"
+readonly CSW_VERSION="2.5.0"
 
 # Repo info (used for update checks)
 readonly CSW_REPO="siamahnaf/csw"
@@ -12,6 +12,8 @@ readonly CSW_DEFAULT_BRANCH="main"
 # Configuration
 readonly BACKUP_DIR="$HOME/.claude-switch-backup"
 readonly SEQUENCE_FILE="$BACKUP_DIR/sequence.json"
+readonly _BG_REFRESH_PID_FILE="$BACKUP_DIR/.bg-refresh.pid"
+readonly _BG_REFRESH_LOG="$BACKUP_DIR/.bg-refresh.log"
 
 # -----------------------------
 # Colors / Styled output
@@ -733,8 +735,37 @@ get_current_managed_account_num() {
   ' "$SEQUENCE_FILE" 2>/dev/null | head -n 1
 }
 
+_kill_bg_refresh() {
+  if [[ -f "$_BG_REFRESH_PID_FILE" ]]; then
+    local old_pid
+    old_pid="$(cat "$_BG_REFRESH_PID_FILE" 2>/dev/null)"
+    if [[ -n "$old_pid" ]] && kill -0 "$old_pid" 2>/dev/null; then
+      kill "$old_pid" 2>/dev/null || true
+    fi
+    rm -f "$_BG_REFRESH_PID_FILE"
+  fi
+}
+
+_show_bg_refresh_summary() {
+  [[ ! -f "$_BG_REFRESH_LOG" ]] && return 0
+  if grep -q "finished" "$_BG_REFRESH_LOG" 2>/dev/null; then
+    local ok_count fail_count
+    ok_count="$(grep -c ": refreshed" "$_BG_REFRESH_LOG" 2>/dev/null || echo 0)"
+    fail_count="$(grep -c ": failed" "$_BG_REFRESH_LOG" 2>/dev/null || echo 0)"
+    if [[ "$fail_count" -gt 0 ]]; then
+      warn "Last background refresh: $ok_count refreshed, $fail_count failed (run 'csw refresh-log' for details)"
+    else
+      success "Last background refresh: $ok_count refreshed"
+    fi
+  elif [[ -f "$_BG_REFRESH_PID_FILE" ]]; then
+    info "Background refresh from previous switch is still running..."
+  fi
+}
+
 perform_switch() {
   local target_account="$1"
+  _kill_bg_refresh
+  _show_bg_refresh_summary
   wait_for_claude_close
 
   local target_email
@@ -819,6 +850,59 @@ perform_switch() {
   echo ""
   warn "Please restart Claude Code to use the new authentication."
   echo ""
+
+  # Refresh dormant accounts in the background with 1-minute gaps
+  # so their tokens stay alive for future switches.
+  _refresh_dormant_accounts "$target_account" &
+  echo "$!" > "$_BG_REFRESH_PID_FILE"
+}
+
+_refresh_dormant_accounts() {
+  local skip_account="$1"
+  [[ ! -f "$SEQUENCE_FILE" ]] && return 0
+
+  local account_nums
+  account_nums="$(jq -r '.sequence[]?' "$SEQUENCE_FILE")"
+  [[ -z "$account_nums" ]] && return 0
+
+  # Start fresh log for this run
+  printf "[%s] Background refresh started (skipping Account-%s)\n" \
+    "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$skip_account" > "$_BG_REFRESH_LOG"
+
+  while IFS= read -r num; do
+    [[ "$num" == "$skip_account" ]] && continue
+    local email
+    email="$(jq -r --arg n "$num" '.accounts[$n].email // empty' "$SEQUENCE_FILE")"
+    [[ -z "$email" ]] && continue
+
+    local creds
+    creds="$(read_account_credentials "$num" "$email")"
+    [[ -z "$creds" ]] && continue
+
+    # 1-minute gap before each refresh to stay well under rate limits
+    sleep 60
+
+    local new_creds
+    new_creds="$(refresh_oauth_token "$creds")"
+    if [[ "$new_creds" != "$creds" ]]; then
+      write_account_credentials "$num" "$email" "$new_creds"
+      printf "[%s] Account-%s (%s): refreshed\n" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$num" "$email" >> "$_BG_REFRESH_LOG"
+    else
+      printf "[%s] Account-%s (%s): failed (no change — network error or token expired)\n" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$num" "$email" >> "$_BG_REFRESH_LOG"
+    fi
+  done <<< "$account_nums"
+
+  printf "[%s] Background refresh finished\n" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" >> "$_BG_REFRESH_LOG"
+  rm -f "$_BG_REFRESH_PID_FILE"
+}
+
+cmd_refresh_log() {
+  if [[ ! -f "$_BG_REFRESH_LOG" ]]; then
+    info "No background refresh log found. Run 'csw switch' first."
+    return 0
+  fi
+  title "Background Refresh Log:"
+  cat "$_BG_REFRESH_LOG"
 }
 
 show_usage() {
@@ -831,6 +915,7 @@ show_usage() {
   dimln "  --list                           List all managed accounts"
   dimln "  --switch                         Rotate to next account in sequence"
   dimln "  --switch-to <num|email>          Switch to specific account number or email"
+  dimln "  --refresh-log                    Show background refresh log"
   dimln "  --check-update                   Check for updates"
   dimln "  --update                         Update csw to the latest version"
   dimln "  -v, --version                    Show csw version"
@@ -854,6 +939,7 @@ main() {
   --list|list|ls) cmd_list ;;
   --switch|switch|next) cmd_switch ;;
   --switch-to|switch-to|to) shift; cmd_switch_to "$@" ;;
+  --refresh-log|refresh-log) cmd_refresh_log ;;
   --help|help|-h|"") show_usage ;;
   *) error "Unknown command '$1'"; show_usage; exit 1 ;;
   esac
