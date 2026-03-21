@@ -3,7 +3,7 @@
 
 set -euo pipefail
 
-readonly CSW_VERSION="2.5.1"
+readonly CSW_VERSION="2.5.2"
 
 # Repo info (used for update checks)
 readonly CSW_REPO="siamahnaf/csw"
@@ -170,7 +170,7 @@ refresh_oauth_token() {
   tmp_body="$(mktemp)"
   http_code="$(curl -s -o "$tmp_body" -w '%{http_code}' \
     --max-time 15 \
-    -X POST "https://platform.claude.com/v1/oauth/token" \
+    -X POST "https://console.anthropic.com/v1/oauth/token" \
     -H "Content-Type: application/x-www-form-urlencoded" \
     -H "anthropic-beta: oauth-2025-04-20" \
     --data-urlencode "grant_type=refresh_token" \
