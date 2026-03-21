@@ -3,7 +3,7 @@
 
 set -euo pipefail
 
-readonly CSW_VERSION="2.4.4"
+readonly CSW_VERSION="2.4.6"
 
 # Repo info (used for update checks)
 readonly CSW_REPO="siamahnaf/csw"
@@ -882,8 +882,8 @@ perform_switch() {
   # (handles old backups that may have been stored without sanitization)
   target_creds="$(sanitize_credentials_json "$target_creds")"
 
-  # Proactively refresh the OAuth token so restored credentials are always
-  # current regardless of how long ago this account was last used.
+  # Proactively refresh the OAuth token for the target account so restored
+  # credentials are always current regardless of how long ago it was last used.
   step "Refreshing OAuth token for Account-$target_account..."
   printf '' > "$_REFRESH_STATUS_FILE"
   local refreshed_creds
@@ -892,8 +892,6 @@ perform_switch() {
 
   if [[ "$refresh_status" == "200" && "$refreshed_creds" != "$target_creds" ]]; then
     target_creds="$refreshed_creds"
-    # Persist refreshed credentials back to backup so the new refresh token
-    # is stored — prevents stale tokens on future switches.
     write_account_credentials "$target_account" "$target_email" "$target_creds"
     success "Token refreshed and backup updated."
   elif [[ "$refresh_status" == "401" || "$refresh_status" == "403" ]]; then
@@ -907,8 +905,7 @@ perform_switch() {
     exit 1
   elif [[ "$refresh_status" =~ ^[0-9]+$ && "$refresh_status" != "200" ]]; then
     local err_body; err_body="$(_read_refresh_error_body)"
-    error "Token refresh failed (HTTP $refresh_status)."
-    warn "Server returned an unexpected error. Proceeding with stored credentials (may fail)."
+    warn "Token refresh returned HTTP $refresh_status. Proceeding with stored credentials."
     [[ -n "$err_body" ]] && dimln "  Response: $err_body"
   else
     warn "Token refresh skipped ($refresh_status)."
@@ -950,8 +947,8 @@ perform_switch() {
   warn "Please restart Claude Code to use the new authentication."
   echo ""
 
-  # Refresh all other dormant accounts in the background so their tokens
-  # stay alive. This runs silently — failures are non-blocking.
+  # Refresh other dormant accounts in the background with 1-minute gaps
+  # so their tokens stay alive for future switches.
   _refresh_dormant_accounts "$target_account" &
   echo "$!" > "$_BG_REFRESH_PID_FILE"
 }
@@ -969,7 +966,6 @@ _refresh_dormant_accounts() {
   account_nums="$(jq -r '.sequence[]?' "$SEQUENCE_FILE")"
   [[ -z "$account_nums" ]] && return 0
 
-  local _first=true
   while IFS= read -r num; do
     [[ "$num" == "$skip_account" ]] && continue
     local email
@@ -980,12 +976,8 @@ _refresh_dormant_accounts() {
     creds="$(read_account_credentials "$num" "$email")"
     [[ -z "$creds" ]] && continue
 
-    # Stagger requests to avoid hitting rate limits
-    if [[ "$_first" == true ]]; then
-      _first=false
-    else
-      sleep 3
-    fi
+    # 1-minute gap between each refresh to stay well under rate limits
+    sleep 60
 
     printf '' > "$_REFRESH_STATUS_FILE"
     local new_creds
