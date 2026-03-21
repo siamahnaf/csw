@@ -3,7 +3,7 @@
 
 set -euo pipefail
 
-readonly CSW_VERSION="2.4.0"
+readonly CSW_VERSION="2.4.2"
 
 # Repo info (used for update checks)
 readonly CSW_REPO="siamahnaf/csw"
@@ -172,26 +172,37 @@ refresh_oauth_token() {
     return 0
   fi
 
-  local tmp_body http_code
-  tmp_body="$(mktemp)"
-  http_code="$(curl -s -o "$tmp_body" -w '%{http_code}' \
-    --max-time 15 \
-    -X POST "https://platform.claude.com/v1/oauth/token" \
-    -H "Content-Type: application/x-www-form-urlencoded" \
-    -H "anthropic-beta: oauth-2025-04-20" \
-    --data-urlencode "grant_type=refresh_token" \
-    --data-urlencode "refresh_token=$refresh_token" \
-    --data-urlencode "client_id=9d1c250a-e61b-44d9-88ed-5944d1962f5e" \
-    2>/dev/null)" || {
-      rm -f "$tmp_body"
-      printf 'network_error' > "$_REFRESH_STATUS_FILE"
-      printf '%s' "$creds"
-      return 0
-    }
+  local tmp_body http_code body
+  local _retry_count=0 _max_retries=3 _backoff=2
 
-  local body
-  body="$(cat "$tmp_body")"
-  rm -f "$tmp_body"
+  while true; do
+    tmp_body="$(mktemp)"
+    http_code="$(curl -s -o "$tmp_body" -w '%{http_code}' \
+      --max-time 15 \
+      -X POST "https://platform.claude.com/v1/oauth/token" \
+      -H "Content-Type: application/x-www-form-urlencoded" \
+      -H "anthropic-beta: oauth-2025-04-20" \
+      --data-urlencode "grant_type=refresh_token" \
+      --data-urlencode "refresh_token=$refresh_token" \
+      --data-urlencode "client_id=9d1c250a-e61b-44d9-88ed-5944d1962f5e" \
+      2>/dev/null)" || {
+        rm -f "$tmp_body"
+        printf 'network_error' > "$_REFRESH_STATUS_FILE"
+        printf '%s' "$creds"
+        return 0
+      }
+
+    body="$(cat "$tmp_body")"
+    rm -f "$tmp_body"
+
+    if [[ "$http_code" == "429" && $_retry_count -lt $_max_retries ]]; then
+      _retry_count=$(( _retry_count + 1 ))
+      sleep "$_backoff"
+      _backoff=$(( _backoff * 2 ))
+      continue
+    fi
+    break
+  done
 
   if [[ "$http_code" != "200" ]]; then
     printf '%s\n%s' "$http_code" "$body" > "$_REFRESH_STATUS_FILE"
@@ -943,6 +954,7 @@ _refresh_dormant_accounts() {
   account_nums="$(jq -r '.sequence[]?' "$SEQUENCE_FILE")"
   [[ -z "$account_nums" ]] && return 0
 
+  local _first=true
   while IFS= read -r num; do
     [[ "$num" == "$skip_account" ]] && continue
     local email
@@ -952,6 +964,13 @@ _refresh_dormant_accounts() {
     local creds
     creds="$(read_account_credentials "$num" "$email")"
     [[ -z "$creds" ]] && continue
+
+    # Stagger requests to avoid hitting rate limits
+    if [[ "$_first" == true ]]; then
+      _first=false
+    else
+      sleep 3
+    fi
 
     printf '' > "$_REFRESH_STATUS_FILE"
     local new_creds
