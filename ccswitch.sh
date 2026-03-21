@@ -3,7 +3,7 @@
 
 set -euo pipefail
 
-readonly CSW_VERSION="2.3.4"
+readonly CSW_VERSION="2.4.0"
 
 # Repo info (used for update checks)
 readonly CSW_REPO="siamahnaf/csw"
@@ -159,11 +159,18 @@ sanitize_credentials_json() {
 # and (if the server rotates tokens) a new refreshToken.
 # On ANY failure (network error, expired refresh token, bad response, etc.) the
 # original credentials are returned unchanged — the caller falls back gracefully.
+# Shared temp file for refresh status (subshell-safe communication)
+_REFRESH_STATUS_FILE="$(mktemp 2>/dev/null || echo "/tmp/.csw-refresh-status-$$")"
+
 refresh_oauth_token() {
   local creds="$1"
   local refresh_token
   refresh_token="$(printf '%s' "$creds" | jq -r '.claudeAiOauth.refreshToken // empty' 2>/dev/null)"
-  [[ -z "$refresh_token" ]] && { printf '%s' "$creds"; return 0; }
+  if [[ -z "$refresh_token" ]]; then
+    printf 'no_token' > "$_REFRESH_STATUS_FILE"
+    printf '%s' "$creds"
+    return 0
+  fi
 
   local tmp_body http_code
   tmp_body="$(mktemp)"
@@ -175,20 +182,33 @@ refresh_oauth_token() {
     --data-urlencode "grant_type=refresh_token" \
     --data-urlencode "refresh_token=$refresh_token" \
     --data-urlencode "client_id=9d1c250a-e61b-44d9-88ed-5944d1962f5e" \
-    2>/dev/null)" || { rm -f "$tmp_body"; printf '%s' "$creds"; return 0; }
+    2>/dev/null)" || {
+      rm -f "$tmp_body"
+      printf 'network_error' > "$_REFRESH_STATUS_FILE"
+      printf '%s' "$creds"
+      return 0
+    }
 
   local body
   body="$(cat "$tmp_body")"
   rm -f "$tmp_body"
 
-  [[ "$http_code" != "200" ]] && { printf '%s' "$creds"; return 0; }
+  if [[ "$http_code" != "200" ]]; then
+    printf '%s\n%s' "$http_code" "$body" > "$_REFRESH_STATUS_FILE"
+    printf '%s' "$creds"
+    return 0
+  fi
 
   local access_token expires_in new_refresh_token
   access_token="$(printf '%s' "$body" | jq -r '.access_token // empty' 2>/dev/null)"
   expires_in="$(printf '%s' "$body" | jq -r '.expires_in // 28800' 2>/dev/null)"
   new_refresh_token="$(printf '%s' "$body" | jq -r '.refresh_token // empty' 2>/dev/null)"
 
-  [[ -z "$access_token" ]] && { printf '%s' "$creds"; return 0; }
+  if [[ -z "$access_token" ]]; then
+    printf 'no_access_token' > "$_REFRESH_STATUS_FILE"
+    printf '%s' "$creds"
+    return 0
+  fi
 
   local expires_at
   expires_at="$(( $(date +%s) * 1000 + expires_in * 1000 ))"
@@ -205,9 +225,23 @@ refresh_oauth_token() {
         | .claudeAiOauth.expiresAt  = $ea
         | .claudeAiOauth.refreshToken = $rt
       else . end
-    ' 2>/dev/null)" || { printf '%s' "$creds"; return 0; }
+    ' 2>/dev/null)" || {
+      printf 'jq_error' > "$_REFRESH_STATUS_FILE"
+      printf '%s' "$creds"
+      return 0
+    }
 
+  printf '200' > "$_REFRESH_STATUS_FILE"
   printf '%s' "$updated_creds"
+}
+
+# Read refresh status from temp file (call after refresh_oauth_token)
+_read_refresh_status() {
+  [[ -f "$_REFRESH_STATUS_FILE" ]] && head -n 1 "$_REFRESH_STATUS_FILE" || echo ""
+}
+
+_read_refresh_error_body() {
+  [[ -f "$_REFRESH_STATUS_FILE" ]] && tail -n +2 "$_REFRESH_STATUS_FILE" || echo ""
 }
 
 # -----------------------------
@@ -685,6 +719,60 @@ get_next_in_sequence() {
   ' "$SEQUENCE_FILE"
 }
 
+cmd_refresh_all() {
+  [[ ! -f "$SEQUENCE_FILE" ]] && { error "No accounts are managed yet"; exit 1; }
+
+  title "Refreshing tokens for all managed accounts..."
+  local failed=0 refreshed=0 skipped=0
+
+  local account_nums
+  account_nums="$(jq -r '.sequence[]?' "$SEQUENCE_FILE")"
+  [[ -z "$account_nums" ]] && { warn "No accounts in sequence."; exit 0; }
+
+  while IFS= read -r num; do
+    local email
+    email="$(jq -r --arg n "$num" '.accounts[$n].email // empty' "$SEQUENCE_FILE")"
+    [[ -z "$email" ]] && continue
+
+    local creds
+    creds="$(read_account_credentials "$num" "$email")"
+    if [[ -z "$creds" ]]; then
+      warn "  Account-$num ($email): no stored credentials — skipped"
+      skipped=$((skipped + 1))
+      continue
+    fi
+
+    printf '' > "$_REFRESH_STATUS_FILE"
+    local new_creds
+    new_creds="$(refresh_oauth_token "$creds")"
+    local status; status="$(_read_refresh_status)"
+
+    if [[ "$status" == "200" && "$new_creds" != "$creds" ]]; then
+      write_account_credentials "$num" "$email" "$new_creds"
+      success "  Account-$num ($email): refreshed"
+      refreshed=$((refreshed + 1))
+    elif [[ "$status" == "401" || "$status" == "403" ]]; then
+      error "  Account-$num ($email): refresh failed (HTTP $status) — token revoked"
+      warn "    -> Log into this account and re-add it: csw remove-account $num && csw add-account"
+      failed=$((failed + 1))
+    elif [[ "$status" =~ ^[0-9]+$ && "$status" != "200" ]]; then
+      error "  Account-$num ($email): refresh failed (HTTP $status)"
+      failed=$((failed + 1))
+    else
+      dimln "  Account-$num ($email): skipped ($status)"
+      skipped=$((skipped + 1))
+    fi
+  done <<< "$account_nums"
+
+  echo ""
+  if [[ $failed -gt 0 ]]; then
+    warn "Done. Failed: $failed | Skipped: $skipped"
+    warn "Re-add failed accounts by logging in and running: csw add-account"
+  else
+    success "All account tokens are up to date."
+  fi
+}
+
 cmd_switch() {
   [[ ! -f "$SEQUENCE_FILE" ]] && { error "No accounts are managed yet"; exit 1; }
 
@@ -771,17 +859,34 @@ perform_switch() {
 
   # Proactively refresh the OAuth token so restored credentials are always
   # current regardless of how long ago this account was last used.
-  # If the refresh succeeds the new accessToken/expiresAt/refreshToken are
-  # used; if it fails for any reason the stored credentials are used as-is
-  # (same behaviour as before — works until the stored accessToken expires).
   step "Refreshing OAuth token for Account-$target_account..."
+  printf '' > "$_REFRESH_STATUS_FILE"
   local refreshed_creds
   refreshed_creds="$(refresh_oauth_token "$target_creds")"
-  if [[ "$refreshed_creds" != "$target_creds" ]]; then
+  local refresh_status; refresh_status="$(_read_refresh_status)"
+
+  if [[ "$refresh_status" == "200" && "$refreshed_creds" != "$target_creds" ]]; then
     target_creds="$refreshed_creds"
-    success "Token refreshed."
+    # Persist refreshed credentials back to backup so the new refresh token
+    # is stored — prevents stale tokens on future switches.
+    write_account_credentials "$target_account" "$target_email" "$target_creds"
+    success "Token refreshed and backup updated."
+  elif [[ "$refresh_status" == "401" || "$refresh_status" == "403" ]]; then
+    local err_body; err_body="$(_read_refresh_error_body)"
+    error "Token refresh failed (HTTP $refresh_status)."
+    error "The refresh token for this account has been revoked or expired."
+    [[ -n "$err_body" ]] && dimln "  Server: $err_body"
+    echo ""
+    warn "To fix: log into this account in Claude Code, then run:"
+    dimln "  csw remove-account $target_account && csw add-account"
+    exit 1
+  elif [[ "$refresh_status" =~ ^[0-9]+$ && "$refresh_status" != "200" ]]; then
+    local err_body; err_body="$(_read_refresh_error_body)"
+    error "Token refresh failed (HTTP $refresh_status)."
+    warn "Server returned an unexpected error. Proceeding with stored credentials (may fail)."
+    [[ -n "$err_body" ]] && dimln "  Response: $err_body"
   else
-    warn "Token refresh skipped (no network or stored token already valid)."
+    warn "Token refresh skipped ($refresh_status)."
   fi
 
   step "Applying target credentials/config..."
@@ -819,6 +924,44 @@ perform_switch() {
   echo ""
   warn "Please restart Claude Code to use the new authentication."
   echo ""
+
+  # Refresh all other dormant accounts in the background so their tokens
+  # stay alive. This runs silently — failures are non-blocking.
+  _refresh_dormant_accounts "$target_account" &
+}
+
+_refresh_dormant_accounts() {
+  local skip_account="$1"
+  [[ ! -f "$SEQUENCE_FILE" ]] && return 0
+
+  # Use a private status file so we don't race with the foreground process
+  _REFRESH_STATUS_FILE="$(mktemp 2>/dev/null || echo "/tmp/.csw-refresh-bg-$$")"
+  # shellcheck disable=SC2064
+  trap "rm -f \"$_REFRESH_STATUS_FILE\"" EXIT
+
+  local account_nums
+  account_nums="$(jq -r '.sequence[]?' "$SEQUENCE_FILE")"
+  [[ -z "$account_nums" ]] && return 0
+
+  while IFS= read -r num; do
+    [[ "$num" == "$skip_account" ]] && continue
+    local email
+    email="$(jq -r --arg n "$num" '.accounts[$n].email // empty' "$SEQUENCE_FILE")"
+    [[ -z "$email" ]] && continue
+
+    local creds
+    creds="$(read_account_credentials "$num" "$email")"
+    [[ -z "$creds" ]] && continue
+
+    printf '' > "$_REFRESH_STATUS_FILE"
+    local new_creds
+    new_creds="$(refresh_oauth_token "$creds")"
+    local status; status="$(_read_refresh_status)"
+
+    if [[ "$status" == "200" && "$new_creds" != "$creds" ]]; then
+      write_account_credentials "$num" "$email" "$new_creds"
+    fi
+  done <<< "$account_nums"
 }
 
 show_usage() {
@@ -831,6 +974,7 @@ show_usage() {
   dimln "  --list                           List all managed accounts"
   dimln "  --switch                         Rotate to next account in sequence"
   dimln "  --switch-to <num|email>          Switch to specific account number or email"
+  dimln "  --refresh-all                    Refresh OAuth tokens for all accounts"
   dimln "  --check-update                   Check for updates"
   dimln "  --update                         Update csw to the latest version"
   dimln "  -v, --version                    Show csw version"
@@ -854,11 +998,14 @@ main() {
   --list|list|ls) cmd_list ;;
   --switch|switch|next) cmd_switch ;;
   --switch-to|switch-to|to) shift; cmd_switch_to "$@" ;;
+  --refresh-all|refresh-all|refresh) cmd_refresh_all ;;
   --help|help|-h|"") show_usage ;;
   *) error "Unknown command '$1'"; show_usage; exit 1 ;;
   esac
 }
 
 if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
+  # shellcheck disable=SC2064
+  trap "rm -f \"$_REFRESH_STATUS_FILE\"" EXIT
   main "$@"
 fi
