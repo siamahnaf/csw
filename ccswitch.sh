@@ -829,6 +829,7 @@ perform_switch() {
     0)
       target_creds="$refreshed_creds"
       write_account_credentials "$target_account" "$target_email" "$refreshed_creds"
+      echo "[$(date '+%Y-%m-%d %H:%M:%S')] [FG] Account-$target_account ($target_email): Token refreshed successfully." >> "$LOG_FILE"
       success "Token refreshed successfully — new access token applied and saved to backup."
       ;;
     1)
