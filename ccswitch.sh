@@ -3,7 +3,7 @@
 
 set -euo pipefail
 
-readonly CSW_VERSION="2.4.0"
+readonly CSW_VERSION="2.4.5"
 
 # Repo info (used for update checks)
 readonly CSW_REPO="siamahnaf/csw"
@@ -901,44 +901,56 @@ perform_switch() {
 
   success "Switched to Account-$target_account ($target_email)"
 
-  # Background-refresh the OTHER account's token (the one we just backed up)
-  # so it stays fresh for the next switch, without blocking the user.
-  if [[ -n "$current_account" && "$current_account" != "null" && "$current_email" != "none" ]]; then
-    (
+  # Background-refresh ALL non-active accounts' tokens so they stay fresh
+  # for the next switch. Each account is refreshed with a 2-minute gap.
+  (
+    local acct_num acct_email first=1
+    while IFS= read -r acct_num; do
+      [[ "$acct_num" == "$target_account" ]] && continue
+      acct_email="$(jq -r --arg num "$acct_num" '.accounts[$num].email // empty' "$SEQUENCE_FILE" 2>/dev/null)"
+      [[ -z "$acct_email" ]] && continue
+
+      # 2-minute gap between each refresh (skip delay for the first one)
+      if [[ $first -eq 1 ]]; then
+        first=0
+      else
+        sleep 120
+      fi
+
       local bg_msg_file ts other_creds other_refreshed other_rc
       bg_msg_file="$(mktemp)"
       ts="$(date '+%Y-%m-%d %H:%M:%S')"
       other_rc=0
-      other_creds="$(read_account_credentials "$current_account" "$current_email")"
+      other_creds="$(read_account_credentials "$acct_num" "$acct_email")"
       if [[ -z "$other_creds" ]]; then
-        echo "[$ts] [BG] Account-$current_account ($current_email): No stored credentials found — skipped." >> "$LOG_FILE"
+        echo "[$ts] [BG] Account-$acct_num ($acct_email): No stored credentials found — skipped." >> "$LOG_FILE"
       else
         other_refreshed="$(refresh_oauth_token "$other_creds" "$bg_msg_file")" || other_rc=$?
         case $other_rc in
           0)
-            write_account_credentials "$current_account" "$current_email" "$other_refreshed"
-            echo "[$ts] [BG] Account-$current_account ($current_email): Token refreshed successfully." >> "$LOG_FILE"
+            write_account_credentials "$acct_num" "$acct_email" "$other_refreshed"
+            echo "[$ts] [BG] Account-$acct_num ($acct_email): Token refreshed successfully." >> "$LOG_FILE"
             ;;
           1)
-            echo "[$ts] [BG] Account-$current_account ($current_email): No refreshToken found — skipped." >> "$LOG_FILE"
+            echo "[$ts] [BG] Account-$acct_num ($acct_email): No refreshToken found — skipped." >> "$LOG_FILE"
             ;;
           2)
-            echo "[$ts] [BG] Account-$current_account ($current_email): Network error — could not reach server." >> "$LOG_FILE"
+            echo "[$ts] [BG] Account-$acct_num ($acct_email): Network error — could not reach server." >> "$LOG_FILE"
             ;;
           3)
             local bg_response=""
             [[ -f "$bg_msg_file" ]] && bg_response="$(cat "$bg_msg_file" 2>/dev/null)"
-            echo "[$ts] [BG] Account-$current_account ($current_email): Server error — $bg_response" >> "$LOG_FILE"
+            echo "[$ts] [BG] Account-$acct_num ($acct_email): Server error — $bg_response" >> "$LOG_FILE"
             ;;
           4)
-            echo "[$ts] [BG] Account-$current_account ($current_email): Invalid/empty server response." >> "$LOG_FILE"
+            echo "[$ts] [BG] Account-$acct_num ($acct_email): Invalid/empty server response." >> "$LOG_FILE"
             ;;
         esac
       fi
       rm -f "$bg_msg_file"
-    ) &
-    disown 2>/dev/null
-  fi
+    done < <(jq -r '.sequence[]? | tostring' "$SEQUENCE_FILE" 2>/dev/null)
+  ) &
+  disown 2>/dev/null
 
   cmd_list
   echo ""
@@ -954,7 +966,25 @@ cmd_log() {
 
   local lines="${1:-20}"
   [[ ! "$lines" =~ ^[0-9]+$ ]] && { error "Usage: $0 --log [number]"; return 1; }
-  title "csw — Background Refresh Logs (last $lines entries)"
+
+  # Show last refresh status per account
+  if [[ -f "$SEQUENCE_FILE" ]]; then
+    title "Last Refresh Status:"
+    local acct_num acct_email last_entry
+    while IFS= read -r acct_num; do
+      acct_email="$(jq -r --arg num "$acct_num" '.accounts[$num].email // empty' "$SEQUENCE_FILE" 2>/dev/null)"
+      [[ -z "$acct_email" ]] && continue
+      last_entry="$(grep "Account-$acct_num ($acct_email)" "$LOG_FILE" 2>/dev/null | tail -1)"
+      if [[ -n "$last_entry" ]]; then
+        dimln "  $last_entry"
+      else
+        dimln "  Account-$acct_num ($acct_email): No refresh logs yet."
+      fi
+    done < <(jq -r '.sequence[]? | tostring' "$SEQUENCE_FILE" 2>/dev/null)
+    echo ""
+  fi
+
+  title "Recent Logs (last $lines entries):"
   echo ""
   tail -n "$lines" "$LOG_FILE"
   echo ""
