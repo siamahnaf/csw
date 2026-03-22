@@ -16,6 +16,10 @@ It only switches **authentication** — your **themes, settings, preferences, an
 
 - **Multi-account management**: add, remove, list accounts
 - **Fast switching**: rotate to the next account or switch to a specific one
+- **Automatic token refresh**: OAuth tokens are refreshed on every switch
+  - **Foreground**: target account is refreshed before activation
+  - **Background**: all other accounts are refreshed with a 2-minute gap to avoid rate limits
+- **Refresh logs**: view token refresh status with `csw log`
 - **Cross-platform**: macOS, Linux, WSL
 - **Secure storage**
   - **macOS**: credentials stored in **Keychain**
@@ -75,6 +79,9 @@ csw switch-to user2@example.com
 # Remove an account (by number or email)
 csw remove-account 2
 csw remove-account user2@example.com
+
+# View token refresh logs from the last switch
+csw log
 
 # Help
 csw -help

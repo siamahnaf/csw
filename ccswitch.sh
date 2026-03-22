@@ -3,7 +3,7 @@
 
 set -euo pipefail
 
-readonly CSW_VERSION="2.4.5"
+readonly CSW_VERSION="2.5.0"
 
 # Repo info (used for update checks)
 readonly CSW_REPO="siamahnaf/csw"
@@ -821,6 +821,9 @@ perform_switch() {
   # If the refresh succeeds the new accessToken/expiresAt/refreshToken are
   # used; if it fails for any reason the stored credentials are used as-is
   # (same behaviour as before — works until the stored accessToken expires).
+  # Clear log file — csw log only shows the current switch run
+  printf '' > "$LOG_FILE"
+
   step "Refreshing OAuth token for Account-$target_account..."
   local fg_msg_file; fg_msg_file="$(mktemp)"
   local refreshed_creds refresh_rc=0
@@ -960,17 +963,16 @@ perform_switch() {
 }
 
 cmd_log() {
-  if [[ ! -f "$LOG_FILE" ]]; then
-    info "No logs found yet. Logs are created when background token refresh runs during switch."
+  if [[ ! -f "$LOG_FILE" || ! -s "$LOG_FILE" ]]; then
+    info "No logs found. Logs are created when token refresh runs during switch."
     return 0
   fi
 
-  local lines="${1:-20}"
-  [[ ! "$lines" =~ ^[0-9]+$ ]] && { error "Usage: $0 --log [number]"; return 1; }
+  title "Token Refresh Status (last switch):"
+  echo ""
 
-  # Show last refresh status per account
+  # Show per-account status
   if [[ -f "$SEQUENCE_FILE" ]]; then
-    title "Last Refresh Status:"
     local acct_num acct_email last_entry
     while IFS= read -r acct_num; do
       acct_email="$(jq -r --arg num "$acct_num" '.accounts[$num].email // empty' "$SEQUENCE_FILE" 2>/dev/null)"
@@ -979,17 +981,15 @@ cmd_log() {
       if [[ -n "$last_entry" ]]; then
         dimln "  $last_entry"
       else
-        dimln "  Account-$acct_num ($acct_email): No refresh logs yet."
+        dimln "  Account-$acct_num ($acct_email): Pending (background refresh may still be running)."
       fi
     done < <(jq -r '.sequence[]? | tostring' "$SEQUENCE_FILE" 2>/dev/null)
     echo ""
   fi
 
-  title "Recent Logs (last $lines entries):"
+  title "Log Entries:"
+  cat "$LOG_FILE"
   echo ""
-  tail -n "$lines" "$LOG_FILE"
-  echo ""
-  dimln "Log file: $LOG_FILE"
 }
 
 show_usage() {
@@ -1002,7 +1002,7 @@ show_usage() {
   dimln "  --list                           List all managed accounts"
   dimln "  --switch                         Rotate to next account in sequence"
   dimln "  --switch-to <num|email>          Switch to specific account number or email"
-  dimln "  --log [N]                        Show last N background refresh logs (default: 20)"
+  dimln "  --log                            Show token refresh logs from last switch"
   dimln "  --check-update                   Check for updates"
   dimln "  --update                         Update csw to the latest version"
   dimln "  -v, --version                    Show csw version"
