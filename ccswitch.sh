@@ -3,7 +3,7 @@
 
 set -euo pipefail
 
-readonly CSW_VERSION="2.3.6"
+readonly CSW_VERSION="2.4.0"
 
 # Repo info (used for update checks)
 readonly CSW_REPO="siamahnaf/csw"
@@ -12,6 +12,7 @@ readonly CSW_DEFAULT_BRANCH="main"
 # Configuration
 readonly BACKUP_DIR="$HOME/.claude-switch-backup"
 readonly SEQUENCE_FILE="$BACKUP_DIR/sequence.json"
+readonly LOG_FILE="$BACKUP_DIR/csw.log"
 
 # -----------------------------
 # Colors / Styled output
@@ -35,13 +36,24 @@ title()   { printf "%s%s%s%s\n"         "$MAGENTA" "$BOLD" "$*" "$RESET"; }
 dimln()   { printf "%s%s%s\n"           "$DIM" "$*" "$RESET"; }
 
 # -----------------------------
+# Claude CLI version (cached, resolved on first use)
+# -----------------------------
+_cached_claude_cli_version=""
+get_claude_cli_version() {
+  if [[ -z "$_cached_claude_cli_version" ]]; then
+    _cached_claude_cli_version="$(claude --version 2>/dev/null | head -1 | awk '{print $1}' || echo '0.0.0')"
+  fi
+  printf '%s' "$_cached_claude_cli_version"
+}
+
+# -----------------------------
 # Container detection
 # -----------------------------
 is_running_in_container() {
   [[ -f /.dockerenv ]] && return 0
   [[ -f /proc/1/cgroup ]] && grep -q 'docker\|lxc\|containerd\|kubepods' /proc/1/cgroup 2>/dev/null && return 0
   [[ -f /proc/self/mountinfo ]] && grep -q 'docker\|overlay' /proc/self/mountinfo 2>/dev/null && return 0
-  [[ -n "${CONTAINER:-}" ]] || [[ -n "${container:-}" ]] && return 0
+  { [[ -n "${CONTAINER:-}" ]] || [[ -n "${container:-}" ]]; } && return 0
   return 1
 }
 
@@ -164,12 +176,12 @@ sanitize_credentials_json() {
 #   0 — token refreshed successfully (stdout has updated creds)
 #   1 — no refreshToken stored in credentials
 #   2 — network error (curl failed or timed out)
-#   3 — server returned non-200 HTTP status (detail in REFRESH_SERVER_MSG)
+#   3 — server returned non-200 HTTP status (detail written to msg_file)
 #   4 — server response missing access_token or malformed JSON
-readonly REFRESH_MSG_FILE="$(mktemp)"
 refresh_oauth_token() {
-  printf '' > "$REFRESH_MSG_FILE"
   local creds="$1"
+  local msg_file="${2:-/dev/null}"
+  printf '' > "$msg_file"
   local refresh_token
   refresh_token="$(printf '%s' "$creds" | jq -r '.claudeAiOauth.refreshToken // empty' 2>/dev/null)"
   [[ -z "$refresh_token" ]] && { printf '%s' "$creds"; return 1; }
@@ -181,7 +193,7 @@ refresh_oauth_token() {
     --max-time 15 \
     -X POST "https://platform.claude.com/v1/oauth/token" \
     -H "Content-Type: application/x-www-form-urlencoded" \
-    -H "User-Agent: claude-cli/2.3.4" \
+    -H "User-Agent: claude-cli/$(get_claude_cli_version)" \
     -H "anthropic-beta: oauth-2025-04-20" \
     --data-urlencode "grant_type=refresh_token" \
     --data-urlencode "refresh_token=$refresh_token" \
@@ -205,7 +217,7 @@ refresh_oauth_token() {
       printf 'RETRY_AFTER=%s\n' "$retry_after"
       printf 'REQUESTS_RESET=%s\n' "$requests_reset"
       printf 'REQUESTS_REMAINING=%s\n' "$requests_remaining"
-    } > "$REFRESH_MSG_FILE"
+    } > "$msg_file"
     printf '%s' "$creds"
     return 3
   fi
@@ -289,14 +301,14 @@ _check_update_available() {
 }
 
 cmd_check_update() {
-  local latest
-  if latest="$(_check_update_available)"; then
-    warn "Update available: ${CSW_VERSION} -> ${latest}"
-    info "Run: csw --update"
-    return 0
-  fi
+  local latest check_rc=0
+  latest="$(_check_update_available)" || check_rc=$?
 
-  case "$?" in
+  case $check_rc in
+    0)
+      warn "Update available: ${CSW_VERSION} -> ${latest}"
+      info "Run: csw --update"
+      ;;
     1) success "You are up to date: ${CSW_VERSION}" ;;
     2)
       warn "No GitHub releases found for ${CSW_REPO}."
@@ -315,23 +327,25 @@ _install_from_tarball() {
 
   mkdir -p "$bin_dir" "$lib_dir"
 
-  local tmp repo_dir
+  local tmp repo_dir install_rc=0
   tmp="$(mktemp -d)"
-  # shellcheck disable=SC2064
-  trap "rm -rf \"$tmp\"" EXIT
 
-  curl -fsSL "$tarball_url" -o "$tmp/repo.tar.gz"
-  tar -xzf "$tmp/repo.tar.gz" -C "$tmp"
+  curl -fsSL "$tarball_url" -o "$tmp/repo.tar.gz" || { rm -rf "$tmp"; return 1; }
+  tar -xzf "$tmp/repo.tar.gz" -C "$tmp" || { rm -rf "$tmp"; return 1; }
 
   repo_dir="$(find "$tmp" -maxdepth 1 -type d -name 'csw-*' | head -n 1)"
   if [[ -z "${repo_dir:-}" || ! -d "$repo_dir" ]]; then
     error "Could not locate extracted repo folder."
+    rm -rf "$tmp"
     return 1
   fi
 
-  cp -f "$repo_dir/ccswitch.sh" "$lib_dir/ccswitch.sh"
-  cp -f "$repo_dir/bin/csw" "$bin_dir/csw"
-  chmod +x "$lib_dir/ccswitch.sh" "$bin_dir/csw"
+  cp -f "$repo_dir/ccswitch.sh" "$lib_dir/ccswitch.sh" && \
+  cp -f "$repo_dir/bin/csw" "$bin_dir/csw" && \
+  chmod +x "$lib_dir/ccswitch.sh" "$bin_dir/csw" || install_rc=$?
+
+  rm -rf "$tmp"
+  [[ $install_rc -ne 0 ]] && { error "Failed to copy files"; return 1; }
 
   success "Installed/updated: $bin_dir/csw"
   info "Library: $lib_dir/ccswitch.sh"
@@ -373,7 +387,7 @@ setup_directories() {
 # Claude process detection
 # -----------------------------
 is_claude_running() {
-  ps -eo pid,comm,args | awk '$2 == "claude" || $3 == "claude" { exit 0 } END { exit 1 }'
+  ps -eo pid,comm,args | awk 'BEGIN{f=0} $2 == "claude" || $3 == "claude" {f=1; exit} END{exit !f}'
 }
 
 wait_for_claude_close() {
@@ -783,8 +797,13 @@ perform_switch() {
 
   if [[ -n "$current_account" && "$current_account" != "null" && "$current_email" != "none" ]]; then
     step "Saving current account backup..."
-    [[ -n "$current_creds" ]] && write_account_credentials "$current_account" "$current_email" "$current_creds" \
-      || warn "Could not read current credentials; skipping credentials backup."
+    if [[ -n "$current_creds" ]]; then
+      if ! write_account_credentials "$current_account" "$current_email" "$current_creds"; then
+        warn "Failed to save credentials for Account-$current_account; skipping credentials backup."
+      fi
+    else
+      warn "Could not read current credentials; skipping credentials backup."
+    fi
     write_account_config "$current_account" "$current_email" "$current_config"
     success "Backed up: Account-$current_account ($current_email)"
   fi
@@ -803,12 +822,14 @@ perform_switch() {
   # used; if it fails for any reason the stored credentials are used as-is
   # (same behaviour as before — works until the stored accessToken expires).
   step "Refreshing OAuth token for Account-$target_account..."
+  local fg_msg_file; fg_msg_file="$(mktemp)"
   local refreshed_creds refresh_rc=0
-  refreshed_creds="$(refresh_oauth_token "$target_creds")" || refresh_rc=$?
+  refreshed_creds="$(refresh_oauth_token "$target_creds" "$fg_msg_file")" || refresh_rc=$?
   case $refresh_rc in
     0)
       target_creds="$refreshed_creds"
-      success "Token refreshed successfully — new access token applied."
+      write_account_credentials "$target_account" "$target_email" "$refreshed_creds"
+      success "Token refreshed successfully — new access token applied and saved to backup."
       ;;
     1)
       warn "Token refresh skipped — no refreshToken found in stored credentials."
@@ -820,11 +841,11 @@ perform_switch() {
       ;;
     3)
       local raw_response http_status retry_after requests_reset requests_remaining
-      raw_response="$(sed -e '/^HTTP_STATUS=/d' -e '/^RETRY_AFTER=/d' -e '/^REQUESTS_RESET=/d' -e '/^REQUESTS_REMAINING=/d' "$REFRESH_MSG_FILE" 2>/dev/null)"
-      http_status="$(grep '^HTTP_STATUS=' "$REFRESH_MSG_FILE" 2>/dev/null | sed 's/HTTP_STATUS=//')"
-      retry_after="$(grep '^RETRY_AFTER=' "$REFRESH_MSG_FILE" 2>/dev/null | sed 's/RETRY_AFTER=//')"
-      requests_reset="$(grep '^REQUESTS_RESET=' "$REFRESH_MSG_FILE" 2>/dev/null | sed 's/REQUESTS_RESET=//')"
-      requests_remaining="$(grep '^REQUESTS_REMAINING=' "$REFRESH_MSG_FILE" 2>/dev/null | sed 's/REQUESTS_REMAINING=//')"
+      raw_response="$(sed -e '/^HTTP_STATUS=/d' -e '/^RETRY_AFTER=/d' -e '/^REQUESTS_RESET=/d' -e '/^REQUESTS_REMAINING=/d' "$fg_msg_file" 2>/dev/null)"
+      http_status="$(grep '^HTTP_STATUS=' "$fg_msg_file" 2>/dev/null | sed 's/HTTP_STATUS=//')"
+      retry_after="$(grep '^RETRY_AFTER=' "$fg_msg_file" 2>/dev/null | sed 's/RETRY_AFTER=//')"
+      requests_reset="$(grep '^REQUESTS_RESET=' "$fg_msg_file" 2>/dev/null | sed 's/REQUESTS_RESET=//')"
+      requests_remaining="$(grep '^REQUESTS_REMAINING=' "$fg_msg_file" 2>/dev/null | sed 's/REQUESTS_REMAINING=//')"
       warn "Token refresh failed — HTTP $http_status from Claude server."
       if [[ -n "$raw_response" ]]; then
         info "Claude server response:"
@@ -846,6 +867,7 @@ perform_switch() {
       info "Using stored credentials as-is. If login fails, re-authenticate with: claude login"
       ;;
   esac
+  rm -f "$fg_msg_file"
 
   step "Applying target credentials/config..."
   write_credentials "$target_creds"
@@ -855,7 +877,7 @@ perform_switch() {
   [[ -z "$oauth_section" || "$oauth_section" == "null" ]] && { error "Invalid oauthAccount in backup"; exit 1; }
 
   # Merge oauthAccount from target and strip all API-key fields to avoid auth-conflict warning
-  local merged_config
+  local merged_config merge_rc=0
   merged_config="$(jq --argjson oauth "$oauth_section" '
       del(
         .apiKeyHelper, .apiKey, .anthropicApiKey, .claudeApiKey,
@@ -864,8 +886,8 @@ perform_switch() {
         .apiKeySource, .hasApiKey
       )
       | .oauthAccount = $oauth
-    ' "$cfg_path" 2>/dev/null)"
-  [[ $? -ne 0 || -z "$merged_config" ]] && { error "Failed to merge config"; exit 1; }
+    ' "$cfg_path" 2>/dev/null)" || merge_rc=$?
+  [[ $merge_rc -ne 0 || -z "$merged_config" ]] && { error "Failed to merge config"; exit 1; }
 
   write_json "$cfg_path" "$merged_config"
 
@@ -878,10 +900,65 @@ perform_switch() {
   write_json "$SEQUENCE_FILE" "$updated"
 
   success "Switched to Account-$target_account ($target_email)"
+
+  # Background-refresh the OTHER account's token (the one we just backed up)
+  # so it stays fresh for the next switch, without blocking the user.
+  if [[ -n "$current_account" && "$current_account" != "null" && "$current_email" != "none" ]]; then
+    (
+      local bg_msg_file ts other_creds other_refreshed other_rc
+      bg_msg_file="$(mktemp)"
+      ts="$(date '+%Y-%m-%d %H:%M:%S')"
+      other_rc=0
+      other_creds="$(read_account_credentials "$current_account" "$current_email")"
+      if [[ -z "$other_creds" ]]; then
+        echo "[$ts] [BG] Account-$current_account ($current_email): No stored credentials found — skipped." >> "$LOG_FILE"
+      else
+        other_refreshed="$(refresh_oauth_token "$other_creds" "$bg_msg_file")" || other_rc=$?
+        case $other_rc in
+          0)
+            write_account_credentials "$current_account" "$current_email" "$other_refreshed"
+            echo "[$ts] [BG] Account-$current_account ($current_email): Token refreshed successfully." >> "$LOG_FILE"
+            ;;
+          1)
+            echo "[$ts] [BG] Account-$current_account ($current_email): No refreshToken found — skipped." >> "$LOG_FILE"
+            ;;
+          2)
+            echo "[$ts] [BG] Account-$current_account ($current_email): Network error — could not reach server." >> "$LOG_FILE"
+            ;;
+          3)
+            local bg_response=""
+            [[ -f "$bg_msg_file" ]] && bg_response="$(cat "$bg_msg_file" 2>/dev/null)"
+            echo "[$ts] [BG] Account-$current_account ($current_email): Server error — $bg_response" >> "$LOG_FILE"
+            ;;
+          4)
+            echo "[$ts] [BG] Account-$current_account ($current_email): Invalid/empty server response." >> "$LOG_FILE"
+            ;;
+        esac
+      fi
+      rm -f "$bg_msg_file"
+    ) &
+    disown 2>/dev/null
+  fi
+
   cmd_list
   echo ""
   warn "Please restart Claude Code to use the new authentication."
   echo ""
+}
+
+cmd_log() {
+  if [[ ! -f "$LOG_FILE" ]]; then
+    info "No logs found yet. Logs are created when background token refresh runs during switch."
+    return 0
+  fi
+
+  local lines="${1:-20}"
+  [[ ! "$lines" =~ ^[0-9]+$ ]] && { error "Usage: $0 --log [number]"; return 1; }
+  title "csw — Background Refresh Logs (last $lines entries)"
+  echo ""
+  tail -n "$lines" "$LOG_FILE"
+  echo ""
+  dimln "Log file: $LOG_FILE"
 }
 
 show_usage() {
@@ -894,6 +971,7 @@ show_usage() {
   dimln "  --list                           List all managed accounts"
   dimln "  --switch                         Rotate to next account in sequence"
   dimln "  --switch-to <num|email>          Switch to specific account number or email"
+  dimln "  --log [N]                        Show last N background refresh logs (default: 20)"
   dimln "  --check-update                   Check for updates"
   dimln "  --update                         Update csw to the latest version"
   dimln "  -v, --version                    Show csw version"
@@ -917,6 +995,7 @@ main() {
   --list|list|ls) cmd_list ;;
   --switch|switch|next) cmd_switch ;;
   --switch-to|switch-to|to) shift; cmd_switch_to "$@" ;;
+  --log|log) shift; cmd_log "$@" ;;
   --help|help|-h|"") show_usage ;;
   *) error "Unknown command '$1'"; show_usage; exit 1 ;;
   esac
