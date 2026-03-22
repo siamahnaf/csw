@@ -181,6 +181,7 @@ refresh_oauth_token() {
     --max-time 15 \
     -X POST "https://platform.claude.com/v1/oauth/token" \
     -H "Content-Type: application/x-www-form-urlencoded" \
+    -H "User-Agent: claude-cli/2.3.4" \
     -H "anthropic-beta: oauth-2025-04-20" \
     --data-urlencode "grant_type=refresh_token" \
     --data-urlencode "refresh_token=$refresh_token" \
