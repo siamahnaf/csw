@@ -3,7 +3,7 @@
 
 set -euo pipefail
 
-readonly CSW_VERSION="2.5.6"
+readonly CSW_VERSION="2.3.4"
 
 # Repo info (used for update checks)
 readonly CSW_REPO="siamahnaf/csw"
@@ -157,13 +157,22 @@ sanitize_credentials_json() {
 # Proactively refresh the OAuth access token using the stored refreshToken.
 # On success returns updated credentials JSON with a fresh accessToken, expiresAt,
 # and (if the server rotates tokens) a new refreshToken.
-# On ANY failure (network error, expired refresh token, bad response, etc.) the
-# original credentials are returned unchanged — the caller falls back gracefully.
+# On ANY failure the original credentials are returned unchanged — the caller
+# falls back gracefully.
+#
+# Return codes:
+#   0 — token refreshed successfully (stdout has updated creds)
+#   1 — no refreshToken stored in credentials
+#   2 — network error (curl failed or timed out)
+#   3 — server returned non-200 HTTP status (detail in REFRESH_SERVER_MSG)
+#   4 — server response missing access_token or malformed JSON
+REFRESH_SERVER_MSG=""
 refresh_oauth_token() {
+  REFRESH_SERVER_MSG=""
   local creds="$1"
   local refresh_token
   refresh_token="$(printf '%s' "$creds" | jq -r '.claudeAiOauth.refreshToken // empty' 2>/dev/null)"
-  [[ -z "$refresh_token" ]] && { printf '%s' "$creds"; return 0; }
+  [[ -z "$refresh_token" ]] && { printf '%s' "$creds"; return 1; }
 
   local tmp_body http_code
   tmp_body="$(mktemp)"
@@ -175,20 +184,26 @@ refresh_oauth_token() {
     --data-urlencode "grant_type=refresh_token" \
     --data-urlencode "refresh_token=$refresh_token" \
     --data-urlencode "client_id=9d1c250a-e61b-44d9-88ed-5944d1962f5e" \
-    2>/dev/null)" || { rm -f "$tmp_body"; printf '%s' "$creds"; return 0; }
+    2>/dev/null)" || { rm -f "$tmp_body"; printf '%s' "$creds"; return 2; }
 
   local body
   body="$(cat "$tmp_body")"
   rm -f "$tmp_body"
 
-  [[ "$http_code" != "200" ]] && { printf '%s' "$creds"; return 0; }
+  if [[ "$http_code" != "200" ]]; then
+    # Capture the server's error message for the caller to display
+    REFRESH_SERVER_MSG="$(printf '%s' "$body" | jq -r '.error_description // .error // .message // empty' 2>/dev/null)"
+    [[ -z "$REFRESH_SERVER_MSG" ]] && REFRESH_SERVER_MSG="HTTP $http_code"
+    printf '%s' "$creds"
+    return 3
+  fi
 
   local access_token expires_in new_refresh_token
   access_token="$(printf '%s' "$body" | jq -r '.access_token // empty' 2>/dev/null)"
   expires_in="$(printf '%s' "$body" | jq -r '.expires_in // 28800' 2>/dev/null)"
   new_refresh_token="$(printf '%s' "$body" | jq -r '.refresh_token // empty' 2>/dev/null)"
 
-  [[ -z "$access_token" ]] && { printf '%s' "$creds"; return 0; }
+  [[ -z "$access_token" ]] && { printf '%s' "$creds"; return 4; }
 
   local expires_at
   expires_at="$(( $(date +%s) * 1000 + expires_in * 1000 ))"
@@ -205,9 +220,10 @@ refresh_oauth_token() {
         | .claudeAiOauth.expiresAt  = $ea
         | .claudeAiOauth.refreshToken = $rt
       else . end
-    ' 2>/dev/null)" || { printf '%s' "$creds"; return 0; }
+    ' 2>/dev/null)" || { printf '%s' "$creds"; return 4; }
 
   printf '%s' "$updated_creds"
+  return 0
 }
 
 # -----------------------------
@@ -775,14 +791,31 @@ perform_switch() {
   # used; if it fails for any reason the stored credentials are used as-is
   # (same behaviour as before — works until the stored accessToken expires).
   step "Refreshing OAuth token for Account-$target_account..."
-  local refreshed_creds
-  refreshed_creds="$(refresh_oauth_token "$target_creds")"
-  if [[ "$refreshed_creds" != "$target_creds" ]]; then
-    target_creds="$refreshed_creds"
-    success "Token refreshed."
-  else
-    warn "Token refresh skipped (no network or stored token already valid)."
-  fi
+  local refreshed_creds refresh_rc=0
+  refreshed_creds="$(refresh_oauth_token "$target_creds")" || refresh_rc=$?
+  case $refresh_rc in
+    0)
+      target_creds="$refreshed_creds"
+      success "Token refreshed successfully — new access token applied."
+      ;;
+    1)
+      warn "Token refresh skipped — no refreshToken found in stored credentials."
+      info "The account will use its existing access token (valid until it expires)."
+      ;;
+    2)
+      warn "Token refresh failed — network error (no internet or server unreachable)."
+      info "Using stored credentials as-is. If the access token has expired, re-login with: claude login"
+      ;;
+    3)
+      warn "Token refresh failed — server rejected the request."
+      [[ -n "$REFRESH_SERVER_MSG" ]] && info "Server response: $REFRESH_SERVER_MSG"
+      info "The refresh token may be expired or revoked. Re-login with: claude login"
+      ;;
+    4)
+      warn "Token refresh failed — server returned an invalid or empty response."
+      info "Using stored credentials as-is. If login fails, re-authenticate with: claude login"
+      ;;
+  esac
 
   step "Applying target credentials/config..."
   write_credentials "$target_creds"
