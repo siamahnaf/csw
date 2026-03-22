@@ -3,7 +3,7 @@
 
 set -euo pipefail
 
-readonly CSW_VERSION="2.3.4"
+readonly CSW_VERSION="2.3.5"
 
 # Repo info (used for update checks)
 readonly CSW_REPO="siamahnaf/csw"
@@ -166,9 +166,9 @@ sanitize_credentials_json() {
 #   2 — network error (curl failed or timed out)
 #   3 — server returned non-200 HTTP status (detail in REFRESH_SERVER_MSG)
 #   4 — server response missing access_token or malformed JSON
-REFRESH_SERVER_MSG=""
+readonly REFRESH_MSG_FILE="$(mktemp)"
 refresh_oauth_token() {
-  REFRESH_SERVER_MSG=""
+  printf '' > "$REFRESH_MSG_FILE"
   local creds="$1"
   local refresh_token
   refresh_token="$(printf '%s' "$creds" | jq -r '.claudeAiOauth.refreshToken // empty' 2>/dev/null)"
@@ -191,9 +191,8 @@ refresh_oauth_token() {
   rm -f "$tmp_body"
 
   if [[ "$http_code" != "200" ]]; then
-    # Capture the server's error message for the caller to display
-    REFRESH_SERVER_MSG="$(printf '%s' "$body" | jq -r '.error_description // .error // .message // empty' 2>/dev/null)"
-    [[ -z "$REFRESH_SERVER_MSG" ]] && REFRESH_SERVER_MSG="HTTP $http_code"
+    # Write the full raw server response so the caller can display it as-is
+    printf '%s\nHTTP_STATUS=%s' "$body" "$http_code" > "$REFRESH_MSG_FILE"
     printf '%s' "$creds"
     return 3
   fi
@@ -807,9 +806,15 @@ perform_switch() {
       info "Using stored credentials as-is. If the access token has expired, re-login with: claude login"
       ;;
     3)
-      warn "Token refresh failed — server rejected the request."
-      [[ -n "$REFRESH_SERVER_MSG" ]] && info "Server response: $REFRESH_SERVER_MSG"
-      info "The refresh token may be expired or revoked. Re-login with: claude login"
+      local raw_response http_status
+      raw_response="$(sed '$d' "$REFRESH_MSG_FILE" 2>/dev/null)"
+      http_status="$(tail -1 "$REFRESH_MSG_FILE" 2>/dev/null | sed 's/HTTP_STATUS=//')"
+      warn "Token refresh failed — HTTP $http_status from Claude server."
+      if [[ -n "$raw_response" ]]; then
+        info "Claude server response:"
+        printf "  %s\n" "$raw_response"
+      fi
+      info "Re-login with: claude login"
       ;;
     4)
       warn "Token refresh failed — server returned an invalid or empty response."
