@@ -3,7 +3,7 @@
 
 set -euo pipefail
 
-readonly CSW_VERSION="2.5.2"
+readonly CSW_VERSION="2.5.6"
 
 # Repo info (used for update checks)
 readonly CSW_REPO="siamahnaf/csw"
@@ -12,7 +12,6 @@ readonly CSW_DEFAULT_BRANCH="main"
 # Configuration
 readonly BACKUP_DIR="$HOME/.claude-switch-backup"
 readonly SEQUENCE_FILE="$BACKUP_DIR/sequence.json"
-readonly _BG_REFRESH_LOG="$BACKUP_DIR/.bg-refresh.log"
 
 # -----------------------------
 # Colors / Styled output
@@ -170,7 +169,7 @@ refresh_oauth_token() {
   tmp_body="$(mktemp)"
   http_code="$(curl -s -o "$tmp_body" -w '%{http_code}' \
     --max-time 15 \
-    -X POST "https://console.anthropic.com/v1/oauth/token" \
+    -X POST "https://platform.claude.com/v1/oauth/token" \
     -H "Content-Type: application/x-www-form-urlencoded" \
     -H "anthropic-beta: oauth-2025-04-20" \
     --data-urlencode "grant_type=refresh_token" \
@@ -820,56 +819,6 @@ perform_switch() {
   echo ""
   warn "Please restart Claude Code to use the new authentication."
   echo ""
-
-  # Refresh all other dormant accounts in the background (1-min gap between each)
-  # so their tokens stay alive for future switches. Runs silently with logging.
-  _refresh_dormant_accounts "$target_account" &
-}
-
-_refresh_dormant_accounts() {
-  local skip_account="$1"
-  [[ ! -f "$SEQUENCE_FILE" ]] && return 0
-
-  local account_nums
-  account_nums="$(jq -r '.sequence[]?' "$SEQUENCE_FILE")"
-  [[ -z "$account_nums" ]] && return 0
-
-  printf "[%s] Background refresh started (skipping active Account-%s)\n" \
-    "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$skip_account" > "$_BG_REFRESH_LOG"
-
-  while IFS= read -r num; do
-    [[ "$num" == "$skip_account" ]] && continue
-    local email
-    email="$(jq -r --arg n "$num" '.accounts[$n].email // empty' "$SEQUENCE_FILE")"
-    [[ -z "$email" ]] && continue
-
-    local creds
-    creds="$(read_account_credentials "$num" "$email")"
-    [[ -z "$creds" ]] && continue
-
-    # 1-minute gap between each refresh to avoid rate limits
-    sleep 60
-
-    local new_creds
-    new_creds="$(refresh_oauth_token "$creds")"
-    if [[ "$new_creds" != "$creds" ]]; then
-      write_account_credentials "$num" "$email" "$new_creds"
-      printf "[%s] Account-%s (%s): refreshed\n" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$num" "$email" >> "$_BG_REFRESH_LOG"
-    else
-      printf "[%s] Account-%s (%s): failed\n" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$num" "$email" >> "$_BG_REFRESH_LOG"
-    fi
-  done <<< "$account_nums"
-
-  printf "[%s] Background refresh finished\n" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" >> "$_BG_REFRESH_LOG"
-}
-
-cmd_refresh_log() {
-  if [[ ! -f "$_BG_REFRESH_LOG" ]]; then
-    info "No background refresh log found. Run 'csw switch' first."
-    return 0
-  fi
-  title "Background Refresh Log:"
-  cat "$_BG_REFRESH_LOG"
 }
 
 show_usage() {
@@ -882,7 +831,6 @@ show_usage() {
   dimln "  --list                           List all managed accounts"
   dimln "  --switch                         Rotate to next account in sequence"
   dimln "  --switch-to <num|email>          Switch to specific account number or email"
-  dimln "  --refresh-log                    Show background token refresh log"
   dimln "  --check-update                   Check for updates"
   dimln "  --update                         Update csw to the latest version"
   dimln "  -v, --version                    Show csw version"
@@ -906,7 +854,6 @@ main() {
   --list|list|ls) cmd_list ;;
   --switch|switch|next) cmd_switch ;;
   --switch-to|switch-to|to) shift; cmd_switch_to "$@" ;;
-  --refresh-log|refresh-log) cmd_refresh_log ;;
   --help|help|-h|"") show_usage ;;
   *) error "Unknown command '$1'"; show_usage; exit 1 ;;
   esac
