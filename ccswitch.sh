@@ -174,9 +174,10 @@ refresh_oauth_token() {
   refresh_token="$(printf '%s' "$creds" | jq -r '.claudeAiOauth.refreshToken // empty' 2>/dev/null)"
   [[ -z "$refresh_token" ]] && { printf '%s' "$creds"; return 1; }
 
-  local tmp_body http_code
+  local tmp_body tmp_headers http_code
   tmp_body="$(mktemp)"
-  http_code="$(curl -s -o "$tmp_body" -w '%{http_code}' \
+  tmp_headers="$(mktemp)"
+  http_code="$(curl -s -o "$tmp_body" -D "$tmp_headers" -w '%{http_code}' \
     --max-time 15 \
     -X POST "https://platform.claude.com/v1/oauth/token" \
     -H "Content-Type: application/x-www-form-urlencoded" \
@@ -184,15 +185,26 @@ refresh_oauth_token() {
     --data-urlencode "grant_type=refresh_token" \
     --data-urlencode "refresh_token=$refresh_token" \
     --data-urlencode "client_id=9d1c250a-e61b-44d9-88ed-5944d1962f5e" \
-    2>/dev/null)" || { rm -f "$tmp_body"; printf '%s' "$creds"; return 2; }
+    2>/dev/null)" || { rm -f "$tmp_body" "$tmp_headers"; printf '%s' "$creds"; return 2; }
 
-  local body
+  local body headers
   body="$(cat "$tmp_body")"
-  rm -f "$tmp_body"
+  headers="$(cat "$tmp_headers")"
+  rm -f "$tmp_body" "$tmp_headers"
 
   if [[ "$http_code" != "200" ]]; then
-    # Write the full raw server response so the caller can display it as-is
-    printf '%s\nHTTP_STATUS=%s' "$body" "$http_code" > "$REFRESH_MSG_FILE"
+    # Extract rate-limit headers from Claude's response
+    local retry_after requests_reset requests_remaining
+    retry_after="$(printf '%s' "$headers" | grep -i '^retry-after:' | head -1 | sed 's/[^:]*:[[:space:]]*//' | tr -d '\r')"
+    requests_reset="$(printf '%s' "$headers" | grep -i '^anthropic-ratelimit-requests-reset:' | head -1 | sed 's/[^:]*:[[:space:]]*//' | tr -d '\r')"
+    requests_remaining="$(printf '%s' "$headers" | grep -i '^anthropic-ratelimit-requests-remaining:' | head -1 | sed 's/[^:]*:[[:space:]]*//' | tr -d '\r')"
+    {
+      printf '%s\n' "$body"
+      printf 'HTTP_STATUS=%s\n' "$http_code"
+      printf 'RETRY_AFTER=%s\n' "$retry_after"
+      printf 'REQUESTS_RESET=%s\n' "$requests_reset"
+      printf 'REQUESTS_REMAINING=%s\n' "$requests_remaining"
+    } > "$REFRESH_MSG_FILE"
     printf '%s' "$creds"
     return 3
   fi
@@ -806,13 +818,25 @@ perform_switch() {
       info "Using stored credentials as-is. If the access token has expired, re-login with: claude login"
       ;;
     3)
-      local raw_response http_status
-      raw_response="$(sed '$d' "$REFRESH_MSG_FILE" 2>/dev/null)"
-      http_status="$(tail -1 "$REFRESH_MSG_FILE" 2>/dev/null | sed 's/HTTP_STATUS=//')"
+      local raw_response http_status retry_after requests_reset requests_remaining
+      raw_response="$(sed -e '/^HTTP_STATUS=/d' -e '/^RETRY_AFTER=/d' -e '/^REQUESTS_RESET=/d' -e '/^REQUESTS_REMAINING=/d' "$REFRESH_MSG_FILE" 2>/dev/null)"
+      http_status="$(grep '^HTTP_STATUS=' "$REFRESH_MSG_FILE" 2>/dev/null | sed 's/HTTP_STATUS=//')"
+      retry_after="$(grep '^RETRY_AFTER=' "$REFRESH_MSG_FILE" 2>/dev/null | sed 's/RETRY_AFTER=//')"
+      requests_reset="$(grep '^REQUESTS_RESET=' "$REFRESH_MSG_FILE" 2>/dev/null | sed 's/REQUESTS_RESET=//')"
+      requests_remaining="$(grep '^REQUESTS_REMAINING=' "$REFRESH_MSG_FILE" 2>/dev/null | sed 's/REQUESTS_REMAINING=//')"
       warn "Token refresh failed — HTTP $http_status from Claude server."
       if [[ -n "$raw_response" ]]; then
         info "Claude server response:"
         printf "  %s\n" "$raw_response"
+      fi
+      if [[ -n "$retry_after" ]]; then
+        info "Retry after: ${retry_after} seconds."
+      fi
+      if [[ -n "$requests_reset" ]]; then
+        info "Rate limit resets at: ${requests_reset}"
+      fi
+      if [[ -n "$requests_remaining" ]]; then
+        info "Requests remaining: ${requests_remaining}"
       fi
       info "Re-login with: claude login"
       ;;
