@@ -325,7 +325,7 @@ function Invoke-OAuthRefresh {
     $refreshToken = ""
     try { $refreshToken = ($Credentials | ConvertFrom-Json).claudeAiOauth.refreshToken } catch {}
     if ([string]::IsNullOrEmpty($refreshToken)) {
-        Add-Content -Path $LOG_FILE -Value "[$ts] [FG] Account-${AccountNum} (${Email}): No refreshToken — skipped."
+        Add-Content -Path $LOG_FILE -Value "[$ts] [FG] Account-${AccountNum} (${Email}): No refreshToken - skipped."
         return @{ Status = 1; Credentials = $Credentials }
     }
 
@@ -357,11 +357,11 @@ function Invoke-OAuthRefresh {
             } catch {}
             $respHeaders = $_.Exception.Response.Headers
         } else {
-            Add-Content -Path $LOG_FILE -Value "[$ts] [FG] Account-${AccountNum} (${Email}): Network error — $($_.Exception.Message)"
+            Add-Content -Path $LOG_FILE -Value "[$ts] [FG] Account-${AccountNum} (${Email}): Network error - $($_.Exception.Message)"
             return @{ Status = 2; Credentials = $Credentials }
         }
     } catch {
-        Add-Content -Path $LOG_FILE -Value "[$ts] [FG] Account-${AccountNum} (${Email}): Network error — $($_.Exception.Message)"
+        Add-Content -Path $LOG_FILE -Value "[$ts] [FG] Account-${AccountNum} (${Email}): Network error - $($_.Exception.Message)"
         return @{ Status = 2; Credentials = $Credentials }
     }
 
@@ -467,7 +467,7 @@ function Start-BackgroundRefresh {
                 $obj   = [System.Text.Encoding]::UTF8.GetString($bytes) | ConvertFrom-Json
                 $rt    = $obj.claudeAiOauth.refreshToken
                 if ([string]::IsNullOrEmpty($rt)) {
-                    Add-Content $LogFile "[$ts] [BG] Account-${num} (${email}): No refreshToken — skipped."
+                    Add-Content $LogFile "[$ts] [BG] Account-${num} (${email}): No refreshToken - skipped."
                     continue
                 }
                 $hdrs = @{
@@ -492,7 +492,7 @@ function Start-BackgroundRefresh {
                 Add-Content $LogFile "[$ts] [BG] Account-${num} (${email}): Token refreshed successfully."
             } catch {
                 $sc = if ($_.Exception.Response) { [int]$_.Exception.Response.StatusCode } else { "ERR" }
-                Add-Content $LogFile "[$ts] [BG] Account-${num} (${email}): Failed — HTTP $sc $($_.Exception.Message)"
+                Add-Content $LogFile "[$ts] [BG] Account-${num} (${email}): Failed - HTTP $sc $($_.Exception.Message)"
             }
         }
     }
@@ -554,17 +554,17 @@ function Invoke-PerformSwitch {
         0 {
             $targetCreds = $result.Credentials
             Write-AccountCredentials $TargetNum $targetEmail $targetCreds
-            Write-CSWSuccess "Token refreshed successfully — new access token applied."
+            Write-CSWSuccess "Token refreshed successfully - new access token applied."
         }
-        1 { Write-CSWWarn "Token refresh skipped — no refreshToken in stored credentials." }
-        2 { Write-CSWWarn "Token refresh failed — network error. Using stored credentials." }
+        1 { Write-CSWWarn "Token refresh skipped - no refreshToken in stored credentials." }
+        2 { Write-CSWWarn "Token refresh failed - network error. Using stored credentials." }
         3 {
-            Write-CSWWarn "Token refresh failed — HTTP $($result.HttpStatus)."
+            Write-CSWWarn "Token refresh failed - HTTP $($result.HttpStatus)."
             if ($result.RetryAfter) { Write-CSWInfo "Retry after: $($result.RetryAfter) seconds." }
             if ($result.RateReset)  { Write-CSWInfo "Rate limit resets at: $($result.RateReset)" }
             Write-CSWInfo "Re-login with: claude login"
         }
-        4 { Write-CSWWarn "Token refresh failed — invalid server response. Using stored credentials." }
+        4 { Write-CSWWarn "Token refresh failed - invalid server response. Using stored credentials." }
     }
 
     # Apply credentials
@@ -646,7 +646,7 @@ function Invoke-AddAccount {
     $seq.activeAccountNumber = $accountNum
     Save-SequenceData $seq
 
-    Write-CSWSuccess "Added Account $accountNum: $email"
+    Write-CSWSuccess "Added Account ${accountNum}: $email"
 }
 
 # ---------------------------------------------------------------------------
@@ -845,7 +845,7 @@ function Invoke-Update {
 # show_usage
 # ---------------------------------------------------------------------------
 function Show-Usage {
-    Write-CSWTitle "csw — Multi-Account Switcher for Claude Code (Windows)"
+    Write-CSWTitle "csw - Multi-Account Switcher for Claude Code (Windows)"
     Write-Host "  Non-destructive: only switches authentication; themes/settings stay intact." -ForegroundColor DarkGray
     Write-Host ""
     Write-Host "Usage: csw <command> [args]" -ForegroundColor White
