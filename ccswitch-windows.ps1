@@ -76,8 +76,15 @@ function Write-JsonAtomic {
         return $false
     }
     $tmp = "$Path.tmp"
-    Set-Content -Path $tmp -Value $Json -Encoding UTF8 -NoNewline -Force
-    Move-Item -Path $tmp -Destination $Path -Force
+    # [System.IO.File]::WriteAllText is used instead of Set-Content because
+    # Set-Content's -NoNewline flag only exists in PS 6+; PS 5.1 (Windows built-in) lacks it.
+    [System.IO.File]::WriteAllText($tmp, $Json, (New-Object System.Text.UTF8Encoding $false))
+    try {
+        Move-Item -Path $tmp -Destination $Path -Force -ErrorAction Stop
+    } catch {
+        Remove-Item -Path $tmp -Force -ErrorAction SilentlyContinue
+        throw $_
+    }
     try {
         $acl = Get-Acl $Path
         $acl.SetAccessRuleProtection($true, $false)
@@ -138,8 +145,10 @@ function Get-ClaudeConfigPath {
 $script:_claudeVer = $null
 function Get-ClaudeCLIVersion {
     if ($null -eq $script:_claudeVer) {
-        try   { $script:_claudeVer = (& claude --version 2>$null | Select-Object -First 1) -split ' ' | Select-Object -First 1 }
-        catch { $script:_claudeVer = "0.0.0" }
+        try {
+            $out = & claude --version 2>$null | Select-Object -First 1
+            $script:_claudeVer = if ([string]::IsNullOrEmpty($out)) { "0.0.0" } else { ($out -split ' ')[0] }
+        } catch { $script:_claudeVer = "0.0.0" }
     }
     return $script:_claudeVer
 }
@@ -286,7 +295,7 @@ function Resolve-AccountIdentifier {
 function Get-NextInSequence {
     $seq = Get-SequenceData
     if ($null -eq $seq) { return $null }
-    $arr = @($seq.sequence)
+    $arr = @($seq.sequence | Where-Object { $null -ne $_ })
     if ($arr.Count -eq 0) { return $null }
     $active = $seq.activeAccountNumber
     $idx = -1
@@ -461,14 +470,19 @@ function Start-BackgroundRefresh {
                     Add-Content $LogFile "[$ts] [BG] Account-${num} (${email}): No refreshToken — skipped."
                     continue
                 }
-                $hdrs = @{ "Content-Type" = "application/x-www-form-urlencoded"; "anthropic-beta" = "oauth-2025-04-20" }
+                $hdrs = @{
+                    "Content-Type"   = "application/x-www-form-urlencoded"
+                    "User-Agent"     = "claude-cli/0.0.0"
+                    "anthropic-beta" = "oauth-2025-04-20"
+                }
                 $body = "grant_type=refresh_token&refresh_token=$([Uri]::EscapeDataString($rt))&client_id=9d1c250a-e61b-44d9-88ed-5944d1962f5e"
                 $r    = Invoke-WebRequest -Uri "https://platform.claude.com/v1/oauth/token" `
                         -Method Post -Headers $hdrs -Body $body -TimeoutSec 15 -UseBasicParsing -ErrorAction Stop
                 $ro   = $r.Content | ConvertFrom-Json
+                $ei   = if ($ro.expires_in) { [long]$ro.expires_in } else { 28800 }
                 $obj.claudeAiOauth.accessToken  = $ro.access_token
                 if ($ro.refresh_token) { $obj.claudeAiOauth.refreshToken = $ro.refresh_token }
-                $obj.claudeAiOauth.expiresAt = [DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds() + ([long]$ro.expires_in * 1000)
+                $obj.claudeAiOauth.expiresAt = [DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds() + ($ei * 1000)
                 $newJson  = $obj | ConvertTo-Json -Depth 20 -Compress
                 $newBytes = [System.Text.Encoding]::UTF8.GetBytes($newJson)
                 $newEnc   = [System.Security.Cryptography.ProtectedData]::Protect(
@@ -742,7 +756,7 @@ function Invoke-RemoveAccount {
 # cmd_log
 # ---------------------------------------------------------------------------
 function Invoke-Log {
-    if (-not (Test-Path $LOG_FILE) -or (Get-Item $LOG_FILE).Length -eq 0) {
+    if (-not (Test-Path $LOG_FILE) -or [string]::IsNullOrWhiteSpace((Get-Content $LOG_FILE -Raw))) {
         Write-CSWInfo "No logs found. Logs are created when token refresh runs during switch."; return
     }
     Write-CSWTitle "Token Refresh Status (last switch):"
