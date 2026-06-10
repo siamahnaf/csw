@@ -154,7 +154,7 @@ Invoke-WebRequest -Uri "https://raw.githubusercontent.com/siamahnaf/csw/main/uni
 This does NOT remove backups:
 
 ```powershell
-Remove-Item -Recurse "$env:USERPROFILE\.claude-switch-backup"
+Remove-Item -Recurse -Force "$env:USERPROFILE\.claude-switch-backup" -ErrorAction SilentlyContinue
 ```
 
 ---

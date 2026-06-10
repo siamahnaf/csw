@@ -52,5 +52,5 @@ if ($removedAny) {
 Write-HR
 Write-Host ""
 Write-Warn "Note: this does NOT delete your account backups:"
-Write-Host "  Remove-Item -Recurse `"$env:USERPROFILE\.claude-switch-backup`"" -ForegroundColor White
+Write-Host "  Remove-Item -Recurse -Force `"$env:USERPROFILE\.claude-switch-backup`" -ErrorAction SilentlyContinue" -ForegroundColor White
 Write-Host ""
