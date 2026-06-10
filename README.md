@@ -6,7 +6,7 @@
 
 # Multi-Account Switcher for Claude Code
 
-`csw` is a lightweight CLI to **manage and switch between multiple Claude Code accounts** on **macOS, Linux, and WSL**.
+`csw` is a lightweight CLI to **manage and switch between multiple Claude Code accounts** on **macOS, Linux, WSL, and Windows**.
 
 It only switches **authentication** — your **themes, settings, preferences, and chat history** remain unchanged.
 
@@ -20,10 +20,11 @@ It only switches **authentication** — your **themes, settings, preferences, an
   - **Foreground**: target account is refreshed before activation
   - **Background**: all other accounts are refreshed with a 2-minute gap to avoid rate limits
 - **Refresh logs**: view token refresh status with `csw log`
-- **Cross-platform**: macOS, Linux, WSL
+- **Cross-platform**: macOS, Linux, WSL, Windows
 - **Secure storage**
   - **macOS**: credentials stored in **Keychain**
   - **Linux/WSL**: credentials stored in local files with **restricted permissions**
+  - **Windows**: credentials encrypted with **DPAPI** (current-user scope)
 - **Non-destructive**: does not modify your Claude Code UI settings
 
 ---
@@ -32,13 +33,23 @@ It only switches **authentication** — your **themes, settings, preferences, an
 
 ### Install with one command
 
+**macOS / Linux / WSL:**
+
 ```bash
 curl -fsSL https://raw.githubusercontent.com/siamahnaf/csw/main/install.sh | bash
-````
+```
+
+**Windows (PowerShell — run as your normal user, no admin required):**
+
+```powershell
+Invoke-WebRequest -Uri "https://raw.githubusercontent.com/siamahnaf/csw/main/install-windows.ps1" -OutFile "$env:TEMP\install-windows.ps1"; powershell -ExecutionPolicy Bypass -File "$env:TEMP\install-windows.ps1"
+```
 
 ### Ensure `csw` is on your PATH
 
-If `csw` is not found after install, add `~/.local/bin` to your shell PATH:
+**Windows:** The installer adds `%LOCALAPPDATA%\csw` to your user PATH automatically. Restart your terminal after install.
+
+**macOS / Linux / WSL:** If `csw` is not found after install, add `~/.local/bin` to your shell PATH:
 
 **zsh (default on macOS):**
 
@@ -122,11 +133,29 @@ After switching, **restart Claude Code** to apply the new authentication.
 
 ## Uninstall
 
-    curl -fsSL https://raw.githubusercontent.com/siamahnaf/csw/main/uninstall.sh | bash
+**macOS / Linux / WSL:**
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/siamahnaf/csw/main/uninstall.sh | bash
+```
 
 This does NOT remove backups:
 
-    rm -rf ~/.claude-switch-backup
+```bash
+rm -rf ~/.claude-switch-backup
+```
+
+**Windows:**
+
+```powershell
+Invoke-WebRequest -Uri "https://raw.githubusercontent.com/siamahnaf/csw/main/uninstall-windows.ps1" -OutFile "$env:TEMP\uninstall-windows.ps1"; powershell -ExecutionPolicy Bypass -File "$env:TEMP\uninstall-windows.ps1"
+```
+
+This does NOT remove backups:
+
+```powershell
+Remove-Item -Recurse "$env:USERPROFILE\.claude-switch-backup"
+```
 
 ---
 
