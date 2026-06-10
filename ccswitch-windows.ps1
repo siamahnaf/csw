@@ -3,7 +3,7 @@
 
 $ErrorActionPreference = "Stop"
 
-$CSW_VERSION        = "2.5.0"
+$CSW_VERSION        = "2.6.0"
 $CSW_REPO           = "siamahnaf/csw"
 $CSW_DEFAULT_BRANCH = "main"
 
@@ -681,9 +681,10 @@ function Invoke-List {
         $num   = "$n"
         $p     = $seq.accounts.PSObject.Properties | Where-Object { $_.Name -eq $num }
         if ($null -eq $p) { continue }
-        $isAct = ($activeNum -eq $num)
-        Write-Host ("  {0}: {1}{2}" -f $num, $p.Value.email, (if ($isAct) { " (active)" } else { "" })) `
-            -ForegroundColor (if ($isAct) { "Green" } else { "White" })
+        $isAct  = ($activeNum -eq $num)
+        $marker = if ($isAct) { " (active)" } else { "" }
+        $color  = if ($isAct) { "Green" } else { "White" }
+        Write-Host ("  {0}: {1}{2}" -f $num, $p.Value.email, $marker) -ForegroundColor $color
     }
 }
 
