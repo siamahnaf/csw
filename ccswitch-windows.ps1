@@ -3,7 +3,7 @@
 
 $ErrorActionPreference = "Stop"
 
-$CSW_VERSION        = "2.6.0"
+$CSW_VERSION        = "2.6.1"
 $CSW_REPO           = "siamahnaf/csw"
 $CSW_DEFAULT_BRANCH = "main"
 
@@ -597,7 +597,10 @@ function Invoke-PerformSwitch {
     Save-SequenceData $seq
     Write-CSWSuccess "Switched to Account-$TargetNum ($targetEmail)"
 
-    Start-BackgroundRefresh $TargetNum
+    # Disabled: proactively refreshing inactive accounts' tokens now trips
+    # Anthropic's rotating-refresh-token reuse detection and revokes the token
+    # family (HTTP 400 invalid_grant). Claude Code refreshes on launch instead.
+    # Start-BackgroundRefresh $TargetNum
     Invoke-List
     Write-Host ""
     Write-CSWWarn "Please restart Claude Code to use the new authentication."

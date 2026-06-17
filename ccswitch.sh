@@ -3,7 +3,7 @@
 
 set -euo pipefail
 
-readonly CSW_VERSION="2.6.0"
+readonly CSW_VERSION="2.6.1"
 
 # Repo info (used for update checks)
 readonly CSW_REPO="siamahnaf/csw"
@@ -905,56 +905,20 @@ perform_switch() {
 
   success "Switched to Account-$target_account ($target_email)"
 
-  # Background-refresh ALL non-active accounts' tokens so they stay fresh
-  # for the next switch. Each account is refreshed with a 2-minute gap.
-  (
-    local acct_num acct_email first=1
-    while IFS= read -r acct_num; do
-      [[ "$acct_num" == "$target_account" ]] && continue
-      acct_email="$(jq -r --arg num "$acct_num" '.accounts[$num].email // empty' "$SEQUENCE_FILE" 2>/dev/null)"
-      [[ -z "$acct_email" ]] && continue
-
-      # 2-minute gap between each refresh (skip delay for the first one)
-      if [[ $first -eq 1 ]]; then
-        first=0
-      else
-        sleep 120
-      fi
-
-      local bg_msg_file ts other_creds other_refreshed other_rc
-      bg_msg_file="$(mktemp)"
-      ts="$(date '+%Y-%m-%d %H:%M:%S')"
-      other_rc=0
-      other_creds="$(read_account_credentials "$acct_num" "$acct_email")"
-      if [[ -z "$other_creds" ]]; then
-        echo "[$ts] [BG] Account-$acct_num ($acct_email): No stored credentials found — skipped." >> "$LOG_FILE"
-      else
-        other_refreshed="$(refresh_oauth_token "$other_creds" "$bg_msg_file")" || other_rc=$?
-        case $other_rc in
-          0)
-            write_account_credentials "$acct_num" "$acct_email" "$other_refreshed"
-            echo "[$ts] [BG] Account-$acct_num ($acct_email): Token refreshed successfully." >> "$LOG_FILE"
-            ;;
-          1)
-            echo "[$ts] [BG] Account-$acct_num ($acct_email): No refreshToken found — skipped." >> "$LOG_FILE"
-            ;;
-          2)
-            echo "[$ts] [BG] Account-$acct_num ($acct_email): Network error — could not reach server." >> "$LOG_FILE"
-            ;;
-          3)
-            local bg_response=""
-            [[ -f "$bg_msg_file" ]] && bg_response="$(cat "$bg_msg_file" 2>/dev/null)"
-            echo "[$ts] [BG] Account-$acct_num ($acct_email): Server error — $bg_response" >> "$LOG_FILE"
-            ;;
-          4)
-            echo "[$ts] [BG] Account-$acct_num ($acct_email): Invalid/empty server response." >> "$LOG_FILE"
-            ;;
-        esac
-      fi
-      rm -f "$bg_msg_file"
-    done < <(jq -r '.sequence[]? | tostring' "$SEQUENCE_FILE" 2>/dev/null)
-  ) &
-  disown 2>/dev/null
+  # NOTE: We deliberately do NOT proactively refresh inactive accounts'
+  # tokens in the background anymore.
+  #
+  # Anthropic's OAuth server now uses ROTATING refresh tokens with reuse
+  # detection: each successful refresh invalidates the previous refresh token,
+  # and presenting an already-used token revokes the entire token family
+  # (HTTP 400 invalid_grant — "Refresh token not found or invalid").
+  #
+  # A background job that re-refreshes stored tokens — especially when several
+  # overlapping jobs from rapid switches race on the same account — reliably
+  # trips reuse detection and kills the account's credentials. Claude Code
+  # refreshes its own token on launch, so warming inactive tokens buys nothing
+  # and only creates desync. The foreground refresh of the target account above
+  # is safe because it refreshes, saves, and applies the same new token in sync.
 
   cmd_list
   echo ""
