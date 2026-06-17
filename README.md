@@ -112,7 +112,14 @@ csw -check-update
    ```bash
    csw add-account
    ```
-3. **Log out**, then log in with your second account
+3. **Switch your Claude login to your second account** — run `claude login`
+   (or `/login` inside Claude Code) and sign in with the second account.
+
+   > ⚠️ **Do NOT run `claude logout`.** Logging out revokes that account's
+   > refresh token on Anthropic's servers, which makes `csw switch` fail later
+   > with `HTTP 400 invalid_grant — "Refresh token not found or invalid"`.
+   > Always move between accounts with `claude login` / `/login` / `csw switch`,
+   > never `claude logout`.
 4. Run again:
 
    ```bash
@@ -128,6 +135,38 @@ After switching, **restart Claude Code** to apply the new authentication.
 
 > **What gets switched:** only authentication credentials and OAuth account info.
 > **What stays the same:** themes, settings, preferences, and chat history.
+
+---
+
+## Troubleshooting
+
+### `HTTP 400 invalid_grant — "Refresh token not found or invalid"` when switching
+
+This means the stored refresh token for that account has been **revoked on
+Anthropic's servers** — almost always because `claude logout` was run for that
+account. Logging out revokes the refresh token, so the credentials `csw` saved
+can no longer be refreshed.
+
+**Golden rule:** move between accounts only with `claude login` / `/login` /
+`csw switch`. **Never run `claude logout`** — re-logging in replaces local
+credentials without revoking the previous account's token, but logging out
+kills it permanently.
+
+**To recover a broken account** (example for Account-1, while Account-2 stays
+active and healthy):
+
+```bash
+csw remove-account 1      # drop the stale/dead entry
+claude login              # sign in as that account (mints a FRESH token) — do NOT 'claude logout' first
+csw add-account           # re-capture the fresh credentials
+claude login              # sign back in as your other account (re-login, no logout)
+csw switch                # both accounts now refresh cleanly
+```
+
+> Anthropic uses **rotating refresh tokens with reuse detection**. Each refresh
+> invalidates the previous token, and presenting an already-used token revokes
+> the whole token family. `csw` no longer refreshes inactive accounts in the
+> background for this reason — Claude Code refreshes its own token on launch.
 
 ---
 
