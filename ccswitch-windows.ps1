@@ -3,7 +3,7 @@
 
 $ErrorActionPreference = "Stop"
 
-$CSW_VERSION        = "2.7.0"
+$CSW_VERSION        = "2.8.0"
 $CSW_REPO           = "siamahnaf/csw"
 $CSW_DEFAULT_BRANCH = "main"
 
@@ -21,6 +21,8 @@ $BG_GEN_FILE     = Join-Path $BG_DIR "generation"
 $BG_STATUS_DIR   = Join-Path $BG_DIR "status"
 $BG_TS_DIR       = Join-Path $BG_DIR "last-refresh"
 $BG_LOCK_DIR     = Join-Path $BG_DIR "locks"
+$BG_NEXT_RUN     = Join-Path $BG_DIR "next-run"
+$BG_LAST_SWITCH  = Join-Path $BG_DIR "last-switch"
 
 # Gap between consecutive background refreshes (rate-limit friendly)
 $BG_GAP_SECONDS       = 60
@@ -512,18 +514,58 @@ function Get-RefreshAgeSeconds {
 
 function Format-Duration {
     param([long]$Seconds)
-    if ($Seconds -lt 60)   { return "${Seconds}s ago" }
-    if ($Seconds -lt 3600) { return "$([math]::Floor($Seconds / 60))m ago" }
-    return "$([math]::Floor($Seconds / 3600))h $([math]::Floor(($Seconds % 3600) / 60))m ago"
+    if ($Seconds -lt 60)   { return "${Seconds}s" }
+    if ($Seconds -lt 3600) { return "$([math]::Floor($Seconds / 60))m" }
+    return "$([math]::Floor($Seconds / 3600))h $([math]::Floor(($Seconds % 3600) / 60))m"
 }
+
+function Format-Ago { param([long]$Seconds) return "$(Format-Duration $Seconds) ago" }
 
 # Per-account status, one file per account so concurrent writers never clash.
 function Set-BgStatus {
     param([string]$Num, [string]$Email, [string]$Status, [string]$Detail = "")
     Initialize-BgDirs
     $clean = ($Detail -replace "`t|`r|`n", " ")
+    # Field 5 is the epoch of the transition, so `csw log` can show when each
+    # account was actually refreshed without parsing the log.
     Set-Content -Path (Join-Path $BG_STATUS_DIR $Num) `
-        -Value ("{0}`t{1}`t{2}`t{3}" -f $Num, $Email, $Status, $clean) -Encoding UTF8 -Force
+        -Value ("{0}`t{1}`t{2}`t{3}`t{4}" -f $Num, $Email, $Status, $clean, (Get-NowEpoch)) -Encoding UTF8 -Force
+}
+
+# ---- Schedule published by the worker, read back by `csw log` -------------
+function Set-BgNextRun {
+    param([long]$Epoch)
+    Initialize-BgDirs
+    Set-Content -Path $BG_NEXT_RUN -Value $Epoch -Encoding UTF8 -Force
+}
+
+function Get-BgNextRun {
+    if (-not (Test-Path $BG_NEXT_RUN)) { return $null }
+    try {
+        $raw = (Get-Content $BG_NEXT_RUN -Raw).Trim()
+        if ($raw -notmatch '^\d+$') { return $null }
+        return [long]$raw
+    } catch { return $null }
+}
+
+function Clear-BgNextRun { Remove-Item $BG_NEXT_RUN -Force -ErrorAction SilentlyContinue }
+
+# A retiring worker must not delete the schedule a newer run just published.
+function Clear-BgNextRunIfMine {
+    param([string]$Gen)
+    if (Test-BgGenerationMine $Gen) { Clear-BgNextRun }
+}
+
+function Format-EpochTime {
+    param($Epoch)
+    if ($null -eq $Epoch -or "$Epoch" -notmatch '^\d+$') { return "--:--:--" }
+    return [DateTimeOffset]::FromUnixTimeSeconds([long]$Epoch).ToLocalTime().ToString("HH:mm:ss")
+}
+
+function Format-Until {
+    param([long]$Seconds)
+    if ($Seconds -le 0) { return "now" }
+    return "in $(Format-Duration $Seconds)"
 }
 
 function Get-BgStatus {
@@ -539,6 +581,7 @@ function Get-BgStatus {
             Email  = if ($p.Count -gt 1) { $p[1] } else { "" }
             Status = if ($p.Count -gt 2) { $p[2] } else { "" }
             Detail = if ($p.Count -gt 3) { $p[3] } else { "" }
+            Epoch  = if ($p.Count -gt 4) { $p[4] } else { "" }
         }
     } catch { return $null }
 }
@@ -618,15 +661,19 @@ function Start-BgSleepCancellable {
 # this logs every still-pending account as cancelled and clears the queue.
 # The old worker is deliberately NOT killed - it notices the new generation
 # and stops on its own at a safe point.
+# $KeepNum's status file is left alone: the foreground refresh of the account
+# being switched to has already written this run's status there.
 function Stop-PreviousBgRun {
+    param([string]$KeepNum = "")
     Initialize-BgDirs
     $hadPending = $false
     # A plain foreach (not ForEach-Object) so $hadPending is unambiguously the
     # one in this scope.
     $files = @(Get-ChildItem $BG_STATUS_DIR -File -ErrorAction SilentlyContinue)
     foreach ($f in $files) {
+        if ($KeepNum -ne "" -and $f.Name -eq $KeepNum) { continue }
         $st = Get-BgStatus $f.Name
-        if ($null -ne $st -and $st.Status -eq "PENDING") {
+        if ($null -ne $st -and ($st.Status -eq "PENDING" -or $st.Status -eq "RUNNING")) {
             $hadPending = $true
             Write-RefreshLog "BG" $st.Num $st.Email "Cancelled - superseded by a newer switch."
         }
@@ -646,6 +693,10 @@ function Invoke-BgRefreshOne {
         Write-RefreshLog "BG" $Num $Email "Skipped - account lock held by another csw process."
         return
     }
+    Set-BgStatus $Num $Email "RUNNING" ""
+    # Re-publish the next fire time from *now*, so the schedule shown by
+    # `csw log` stays correct while this refresh is in flight.
+    Set-BgNextRun ((Get-NowEpoch) + $BG_GAP_SECONDS)
     try {
         $creds = Read-AccountCredentials $Num $Email
         if ([string]::IsNullOrEmpty($creds)) {
@@ -704,6 +755,10 @@ function Invoke-BgWorker {
         if (-not (Test-BgGenerationMine $Gen)) { return }
         $delay = if ($first) { $BG_INITIAL_DELAY } else { $BG_GAP_SECONDS }
         $first = $false
+        # Publish the next fire time so `csw log` can show a schedule.
+        Set-BgNextRun ((Get-NowEpoch) + $delay)
+        # Superseded: return without touching next-run, which now belongs to
+        # the newer run.
         if (-not (Start-BgSleepCancellable $delay $Gen)) { return }
         # Re-check right before touching a token - the cheapest possible moment
         # to discover we have been superseded.
@@ -713,6 +768,7 @@ function Invoke-BgWorker {
         if ($null -eq $now -or $now.Status -ne "PENDING") { continue }
         Invoke-BgRefreshOne $item.Num $item.Email
     }
+    Clear-BgNextRunIfMine $Gen
 }
 
 # Build the queue for this switch and spawn the detached worker. Accounts
@@ -725,7 +781,7 @@ function Start-BgRefresh {
     # Bump the generation BEFORE queueing so any in-flight worker stops before
     # it can act on entries this run is about to rewrite.
     Set-Content -Path $BG_GEN_FILE -Value $gen -Encoding UTF8 -Force
-    if (Stop-PreviousBgRun) {
+    if (Stop-PreviousBgRun $TargetNum) {
         Write-CSWInfo "Cancelled pending background refreshes from the previous switch."
     }
 
@@ -743,7 +799,7 @@ function Start-BgRefresh {
 
         $age = Get-RefreshAgeSeconds $num
         if ($null -ne $age -and $age -lt $REFRESH_FRESH_WINDOW) {
-            $human = Format-Duration $age
+            $human = Format-Ago $age
             Set-BgStatus $num $email "ALREADY" $human
             Write-RefreshLog "BG" $num $email "Already refreshed $human - skipped."
             $skipped++
@@ -758,9 +814,14 @@ function Start-BgRefresh {
     }
     if ($queued -eq 0) {
         Remove-Item $BG_PID_FILE -Force -ErrorAction SilentlyContinue
+        Clear-BgNextRun
         Write-CSWInfo "No accounts need a background refresh."
         return
     }
+
+    # Publish the first fire time up front so `csw log` shows a schedule even
+    # before the worker has taken its first breath.
+    Set-BgNextRun ((Get-NowEpoch) + $BG_INITIAL_DELAY)
 
     try {
         $proc = Start-Process -FilePath "powershell.exe" `
@@ -822,6 +883,8 @@ function Invoke-PerformSwitch {
 
     # Clear log for this run
     Set-Content -Path $LOG_FILE -Value "" -Encoding UTF8 -Force
+    Initialize-BgDirs
+    Set-Content -Path $BG_LAST_SWITCH -Value (Get-NowEpoch) -Encoding UTF8 -Force
 
     # Foreground OAuth refresh. Take the account lock first so a background
     # worker from an earlier switch can never refresh this same account at the
@@ -833,6 +896,7 @@ function Invoke-PerformSwitch {
     } else {
         Write-CSWWarn "Another csw process is refreshing this account - using stored credentials."
         Write-RefreshLog "FG" $TargetNum $targetEmail "Skipped - account lock held by another csw process."
+        Set-BgStatus $TargetNum $targetEmail "SKIPPED" "Locked by another csw process"
         $result = @{ Status = 5; Credentials = $targetCreds }
     }
 
@@ -841,17 +905,30 @@ function Invoke-PerformSwitch {
             $targetCreds = $result.Credentials
             Write-AccountCredentials $TargetNum $targetEmail $targetCreds
             Set-RefreshStamp $TargetNum
+            Set-BgStatus $TargetNum $targetEmail "SUCCESS" ""
             Write-CSWSuccess "Token refreshed successfully - new access token applied."
         }
-        1 { Write-CSWWarn "Token refresh skipped - no refreshToken in stored credentials." }
-        2 { Write-CSWWarn "Token refresh failed - network error. Using stored credentials." }
+        1 {
+            Set-BgStatus $TargetNum $targetEmail "SKIPPED" "No refreshToken stored"
+            Write-CSWWarn "Token refresh skipped - no refreshToken in stored credentials."
+        }
+        2 {
+            Set-BgStatus $TargetNum $targetEmail "FAILED" "Network error"
+            Write-CSWWarn "Token refresh failed - network error. Using stored credentials."
+        }
         3 {
+            $d = "HTTP $($result.HttpStatus)"
+            if ($result.RetryAfter) { $d = "$d, retry after $($result.RetryAfter)s" }
+            Set-BgStatus $TargetNum $targetEmail "FAILED" $d
             Write-CSWWarn "Token refresh failed - HTTP $($result.HttpStatus)."
             if ($result.RetryAfter) { Write-CSWInfo "Retry after: $($result.RetryAfter) seconds." }
             if ($result.RateReset)  { Write-CSWInfo "Rate limit resets at: $($result.RateReset)" }
             Write-CSWInfo "Re-login with: claude login"
         }
-        4 { Write-CSWWarn "Token refresh failed - invalid server response. Using stored credentials." }
+        4 {
+            Set-BgStatus $TargetNum $targetEmail "FAILED" "Invalid server response"
+            Write-CSWWarn "Token refresh failed - invalid server response. Using stored credentials."
+        }
         5 { Write-CSWInfo "Using stored credentials as-is (refresh skipped - account was locked)." }
     }
     if ($fgLocked) { Unlock-Account $TargetNum }
@@ -1059,88 +1136,212 @@ function Invoke-RemoveAccount {
 # ---------------------------------------------------------------------------
 # cmd_log
 # ---------------------------------------------------------------------------
-# Render one account's background status line.
-function Write-BgStatusLine {
-    param([string]$Num, [string]$Email, [string]$Status, [string]$Detail)
-    Write-Host "  Account-${Num} (${Email}): " -NoNewline -ForegroundColor White
+# ---------------------------------------------------------------------------
+# cmd_log — status table
+# ---------------------------------------------------------------------------
+function Get-StatusDisplay {
+    param([string]$Status, [string]$Detail, [bool]$WorkerAlive)
     switch ($Status) {
-        "SUCCESS" { Write-Host "Success" -NoNewline -ForegroundColor Green
-                    Write-Host " - token refreshed" -ForegroundColor DarkGray }
-        "PENDING" {
-            Write-Host "Pending" -NoNewline -ForegroundColor Yellow
-            if (Test-BgWorkerAlive) {
-                Write-Host " - queued for background refresh" -ForegroundColor DarkGray
-            } else {
-                Write-Host " - stalled (worker not running; run csw switch again)" -ForegroundColor Red
-            }
+        "SUCCESS"   { return @{ Word = "Success";    Color = "Green";    Note = $Detail } }
+        "RUNNING"   { return @{ Word = "Refreshing"; Color = "Cyan";     Note = "in progress" } }
+        "PENDING"   {
+            if ($WorkerAlive) { return @{ Word = "Pending"; Color = "Yellow"; Note = $Detail } }
+            return @{ Word = "Stalled"; Color = "Red"; Note = "worker gone; run csw switch" }
         }
-        "ALREADY" { Write-Host "Already refreshed" -NoNewline -ForegroundColor Cyan
-                    $d = if ($Detail) { $Detail } else { "recently" }
-                    Write-Host " - $d, skipped" -ForegroundColor DarkGray }
-        "SKIPPED" { Write-Host "Skipped" -NoNewline -ForegroundColor Yellow
-                    Write-Host $(if ($Detail) { " - $Detail" } else { "" }) -ForegroundColor DarkGray }
-        "FAILED"  { Write-Host "Failed" -NoNewline -ForegroundColor Red
-                    Write-Host $(if ($Detail) { " - $Detail" } else { "" }) -ForegroundColor DarkGray }
-        default   { Write-Host "$Status $Detail" -ForegroundColor DarkGray }
+        "ALREADY"   { $n = if ($Detail) { "refreshed $Detail" } else { "refreshed recently" }
+                      return @{ Word = "Fresh";     Color = "Blue";     Note = $n } }
+        "SKIPPED"   { return @{ Word = "Skipped";   Color = "Yellow";   Note = $Detail } }
+        "FAILED"    { return @{ Word = "Failed";    Color = "Red";      Note = $Detail } }
+        "CANCELLED" { return @{ Word = "Cancelled"; Color = "DarkGray"; Note = "superseded" } }
+        default     {
+            $w = if ($Status) { $Status } else { "Not queued" }
+            return @{ Word = $w; Color = "DarkGray"; Note = $Detail }
+        }
     }
 }
 
+function Write-TableRule {
+    param([string]$Left, [string]$Mid, [string]$Right, [int[]]$Widths)
+    $parts = foreach ($w in $Widths) { "─" + ("─" * $w) + "─" }
+    Write-Host ("  " + $Left + ($parts -join $Mid) + $Right) -ForegroundColor DarkGray
+}
+
 function Invoke-Log {
+    param([string]$Flag = "")
+    $showRaw = $Flag -in @("-v", "--verbose", "--full", "-a", "--all")
+
     $haveLog = (Test-Path $LOG_FILE) -and -not [string]::IsNullOrWhiteSpace((Get-Content $LOG_FILE -Raw -ErrorAction SilentlyContinue))
     $haveStatus = (Test-Path $BG_STATUS_DIR) -and
                   ((Get-ChildItem $BG_STATUS_DIR -File -ErrorAction SilentlyContinue | Measure-Object).Count -gt 0)
     if (-not $haveLog -and -not $haveStatus) {
-        Write-CSWInfo "No logs found. Logs are created when token refresh runs during switch."; return
+        Write-CSWInfo "No refresh activity recorded yet. Run: csw switch"; return
     }
-    Write-CSWTitle "Token Refresh Status (last switch):"
-    Write-Host ""
-    # The account switched to is refreshed in the foreground, so its status
-    # comes from the [FG] log line. Every other account is driven by the
-    # background worker, whose live status lives in $BG_STATUS_DIR.
-    if (Test-Path $SEQUENCE_FILE) {
-        $seq = Get-SequenceData
-        if ($null -ne $seq) {
-            $activeNum = "$($seq.activeAccountNumber)"
-            foreach ($n in @($seq.sequence)) {
-                $num = "$n"
-                $p   = $seq.accounts.PSObject.Properties | Where-Object { $_.Name -eq $num }
-                if ($null -eq $p) { continue }
-                $e   = $p.Value.email
+    if (-not (Test-Path $SEQUENCE_FILE)) {
+        Write-CSWInfo "No managed accounts yet. Run: csw add-account"; return
+    }
+    $seq = Get-SequenceData
+    if ($null -eq $seq) { Write-CSWInfo "No managed accounts yet. Run: csw add-account"; return }
 
-                if ($num -eq $activeNum) {
-                    $last = $null
-                    if ($haveLog) {
-                        $last = Get-Content $LOG_FILE |
-                                Where-Object { $_ -like "*[FG] Account-${num} (${e})*" } |
-                                Select-Object -Last 1
-                    }
-                    if ($last) {
-                        $detail = $last -replace '^.*?\): ', ''
-                        Write-Host "  Account-${num} (${e}): " -NoNewline -ForegroundColor White
-                        Write-Host "(active, foreground) " -NoNewline -ForegroundColor DarkGray
-                        Write-Host $detail -ForegroundColor DarkGray
-                    } else {
-                        Write-Host "  Account-${num} (${e}): (active) No refresh recorded for the last switch." -ForegroundColor DarkGray
-                    }
-                    continue
-                }
+    $workerAlive = [bool](Test-BgWorkerAlive)
+    $activeNum   = "$($seq.activeAccountNumber)"
+    $now         = Get-NowEpoch
+    $nextRun     = Get-BgNextRun
 
-                $st = Get-BgStatus $num
-                if ($null -eq $st -or [string]::IsNullOrEmpty($st.Status)) {
-                    Write-Host "  Account-${num} (${e}): Not queued for refresh." -ForegroundColor DarkGray
-                } else {
-                    Write-BgStatusLine $num $e $st.Status $st.Detail
-                }
+    # ---- Pass 1: build rows ----
+    $rows = @()
+    $pendingSeen = 0; $queuedTotal = 0; $runningTotal = 0
+    foreach ($n in @($seq.sequence)) {
+        $num = "$n"
+        $p   = $seq.accounts.PSObject.Properties | Where-Object { $_.Name -eq $num }
+        if ($null -eq $p) { continue }
+        $email = $p.Value.email
+        if ([string]::IsNullOrEmpty($email)) { continue }
+
+        $st     = Get-BgStatus $num
+        $status = if ($null -ne $st) { $st.Status } else { "" }
+        $detail = if ($null -ne $st) { $st.Detail } else { "" }
+        $epoch  = if ($null -ne $st) { $st.Epoch }  else { "" }
+
+        # An ALREADY row was skipped *because* it was refreshed earlier, so its
+        # "When" is that earlier refresh - not when this switch wrote the status.
+        if ($status -eq "ALREADY") {
+            $tsFile = Join-Path $BG_TS_DIR $num
+            if (Test-Path $tsFile) {
+                try {
+                    $prev = (Get-Content $tsFile -Raw).Trim()
+                    if ($prev -match '^\d+$') { $epoch = $prev }
+                } catch {}
             }
-            Write-Host ""
+        }
+
+        $disp = Get-StatusDisplay $status $detail $workerAlive
+        $when = "-"
+        if ($status -eq "PENDING") {
+            # Counted whether or not the worker is alive, so a stalled queue is
+            # never reported as settled.
+            $queuedTotal++
+            if ($workerAlive -and $null -ne $nextRun) {
+                $eta = $nextRun + ($pendingSeen * $BG_GAP_SECONDS)
+                if ($eta -lt $now) { $eta = $now }
+                $when = Format-EpochTime $eta
+                $disp.Note = "due $(Format-Until ($eta - $now))"
+            } elseif ($workerAlive) {
+                $when = "queued"
+            }
+            $pendingSeen++
+        } elseif ($status -eq "RUNNING") {
+            $runningTotal++
+            $when = "now"
+        } elseif ("$epoch" -match '^\d+$') {
+            $when = Format-EpochTime $epoch
+            if ([string]::IsNullOrEmpty($disp.Note)) { $disp.Note = Format-Ago ($now - [long]$epoch) }
+        }
+
+        $rows += [pscustomobject]@{
+            Num   = $num
+            Email = $email
+            Mode  = if ($num -eq $activeNum) { "fg" } else { "bg" }
+            Word  = $disp.Word
+            Color = $disp.Color
+            Note  = if ($null -eq $disp.Note) { "" } else { $disp.Note }
+            When  = $when
         }
     }
-    if (Test-BgWorkerAlive) {
-        Write-CSWInfo "Background worker is running - re-run 'csw log' to see progress."
+    if ($rows.Count -eq 0) { Write-CSWInfo "No managed accounts in the switch sequence."; return }
+
+    # ---- Column widths ----
+    $wNum    = [math]::Max(1, ($rows | ForEach-Object { $_.Num.Length }   | Measure-Object -Maximum).Maximum)
+    $wAcct   = [math]::Max(7, ($rows | ForEach-Object { $_.Email.Length } | Measure-Object -Maximum).Maximum)
+    $wStatus = [math]::Max(6, ($rows | ForEach-Object { $_.Word.Length }  | Measure-Object -Maximum).Maximum)
+    $wNote   = [math]::Max(6, ($rows | ForEach-Object { $_.Note.Length }  | Measure-Object -Maximum).Maximum)
+    $wMode   = 4
+    $wWhen   = 8
+    $widths  = @($wNum, $wAcct, $wMode, $wStatus, $wWhen, $wNote)
+
+    # ---- Header ----
+    $header = "Token refresh — last switch"
+    if (Test-Path $BG_LAST_SWITCH) {
+        try {
+            $ls = (Get-Content $BG_LAST_SWITCH -Raw).Trim()
+            if ($ls -match '^\d+$') {
+                $header = "$header $(Format-EpochTime $ls) ($(Format-Ago ($now - [long]$ls)))"
+            }
+        } catch {}
     }
-    if (-not $haveLog) { Write-Host ""; return }
-    Write-CSWTitle "Log Entries:"
-    Get-Content $LOG_FILE | ForEach-Object { Write-Host $_ }
+    Write-Host ""
+    Write-CSWTitle "  $header"
+    Write-Host ""
+
+    # ---- Table ----
+    Write-TableRule "┌" "┬" "┐" $widths
+    Write-Host "  │ " -NoNewline -ForegroundColor DarkGray
+    Write-Host ("{0,-$wNum}"    -f "#")       -NoNewline -ForegroundColor White
+    Write-Host " │ " -NoNewline -ForegroundColor DarkGray
+    Write-Host ("{0,-$wAcct}"   -f "Account") -NoNewline -ForegroundColor White
+    Write-Host " │ " -NoNewline -ForegroundColor DarkGray
+    Write-Host ("{0,-$wMode}"   -f "Mode")    -NoNewline -ForegroundColor White
+    Write-Host " │ " -NoNewline -ForegroundColor DarkGray
+    Write-Host ("{0,-$wStatus}" -f "Status")  -NoNewline -ForegroundColor White
+    Write-Host " │ " -NoNewline -ForegroundColor DarkGray
+    Write-Host ("{0,-$wWhen}"   -f "When")    -NoNewline -ForegroundColor White
+    Write-Host " │ " -NoNewline -ForegroundColor DarkGray
+    Write-Host ("{0,-$wNote}"   -f "Detail")  -NoNewline -ForegroundColor White
+    Write-Host " │" -ForegroundColor DarkGray
+    Write-TableRule "├" "┼" "┤" $widths
+
+    foreach ($r in $rows) {
+        $modeColor = if ($r.Mode -eq "fg") { "Magenta" } else { "DarkGray" }
+        Write-Host "  │ " -NoNewline -ForegroundColor DarkGray
+        Write-Host ("{0,-$wNum}"    -f $r.Num)   -NoNewline -ForegroundColor White
+        Write-Host " │ " -NoNewline -ForegroundColor DarkGray
+        Write-Host ("{0,-$wAcct}"   -f $r.Email) -NoNewline -ForegroundColor Gray
+        Write-Host " │ " -NoNewline -ForegroundColor DarkGray
+        Write-Host ("{0,-$wMode}"   -f $r.Mode)  -NoNewline -ForegroundColor $modeColor
+        Write-Host " │ " -NoNewline -ForegroundColor DarkGray
+        Write-Host ("{0,-$wStatus}" -f $r.Word)  -NoNewline -ForegroundColor $r.Color
+        Write-Host " │ " -NoNewline -ForegroundColor DarkGray
+        Write-Host ("{0,-$wWhen}"   -f $r.When)  -NoNewline -ForegroundColor DarkGray
+        Write-Host " │ " -NoNewline -ForegroundColor DarkGray
+        Write-Host ("{0,-$wNote}"   -f $r.Note)  -NoNewline -ForegroundColor DarkGray
+        Write-Host " │" -ForegroundColor DarkGray
+    }
+    Write-TableRule "└" "┴" "┘" $widths
+    Write-Host ""
+
+    # ---- Schedule summary ----
+    if ($queuedTotal -eq 0 -and $runningTotal -gt 0) {
+        Write-Host "  Refreshing now" -NoNewline -ForegroundColor Cyan
+        Write-Host " — last account in flight" -ForegroundColor DarkGray
+    } elseif ($queuedTotal -gt 0 -and $workerAlive) {
+        if ($null -ne $nextRun) {
+            $nxt = if ($nextRun -lt $now) { $now } else { $nextRun }
+            $doneAt = $nxt + (($queuedTotal - 1) * $BG_GAP_SECONDS)
+            Write-Host "  Next refresh" -NoNewline -ForegroundColor White
+            Write-Host "   $(Format-EpochTime $nxt)  " -NoNewline
+            Write-Host "($(Format-Until ($nxt - $now)))" -ForegroundColor DarkGray
+            Write-Host "  All done by" -NoNewline -ForegroundColor White
+            Write-Host "    $(Format-EpochTime $doneAt)  " -NoNewline
+            Write-Host "($queuedTotal left, $($BG_GAP_SECONDS)s apart)" -ForegroundColor DarkGray
+        } else {
+            Write-Host "  Next refresh   starting up" -ForegroundColor White
+        }
+    } elseif ($queuedTotal -gt 0) {
+        Write-Host "  $queuedTotal account(s) still queued but the worker is gone" -NoNewline -ForegroundColor Red
+        Write-Host " — run: csw switch" -ForegroundColor White
+    } else {
+        Write-Host "  All accounts settled" -NoNewline -ForegroundColor Green
+        Write-Host " — nothing queued" -ForegroundColor DarkGray
+    }
+
+    if ($showRaw) {
+        Write-Host ""
+        Write-CSWTitle "  Log entries"
+        Write-Host ""
+        if ($haveLog) { Get-Content $LOG_FILE | ForEach-Object { Write-CSWDim $_ } }
+    } elseif ($haveLog) {
+        Write-Host ""
+        Write-CSWDim "Full log: csw log -v"
+    }
     Write-Host ""
 }
 
@@ -1241,7 +1442,7 @@ switch ($cmd) {
     { $_ -in @("switch","next","--switch") }                                 { Invoke-Switch }
     { $_ -in @("switch-to","--switch-to","to") }                             { Invoke-SwitchTo $arg1 }
     { $_ -in @("remove-account","rm-account","--remove-account","--rm-account") } { Invoke-RemoveAccount $arg1 }
-    { $_ -in @("log","--log") }                                              { Invoke-Log }
+    { $_ -in @("log","--log") }                                              { Invoke-Log $arg1 }
     # Internal: entry point for the detached background refresh worker.
     # Not listed in Show-Usage; invoked only by Start-BgRefresh.
     "--bg-refresh"                                                           { Invoke-BgWorker $arg1 }

@@ -3,7 +3,7 @@
 
 set -euo pipefail
 
-readonly CSW_VERSION="2.7.0"
+readonly CSW_VERSION="2.8.0"
 
 # Repo info (used for update checks)
 readonly CSW_REPO="siamahnaf/csw"
@@ -321,20 +321,48 @@ refresh_age_seconds() {
   echo $(( $(now_epoch) - ts ))
 }
 
-human_duration() {
+_rough_duration() {
   local s="$1"
-  if (( s < 60 )); then       echo "${s}s ago"
-  elif (( s < 3600 )); then   echo "$(( s / 60 ))m ago"
-  else                        echo "$(( s / 3600 ))h $(( (s % 3600) / 60 ))m ago"
+  if (( s < 60 )); then       echo "${s}s"
+  elif (( s < 3600 )); then   echo "$(( s / 60 ))m"
+  else                        echo "$(( s / 3600 ))h $(( (s % 3600) / 60 ))m"
   fi
 }
 
+human_duration() { echo "$(_rough_duration "$1") ago"; }
+human_until()    { local s="$1"; (( s <= 0 )) && { echo "now"; return; }; echo "in $(_rough_duration "$s")"; }
+
+# Wall-clock HH:MM:SS for an epoch (BSD `date -r`, GNU `date -d @`).
+epoch_to_hms() {
+  local e="$1"
+  [[ "$e" =~ ^[0-9]+$ ]] || { echo "--:--:--"; return; }
+  date -r "$e" '+%H:%M:%S' 2>/dev/null \
+    || date -d "@$e" '+%H:%M:%S' 2>/dev/null \
+    || echo "--:--:--"
+}
+
+# When the sleeping worker will fire next (epoch), or empty if not scheduled.
+bg_next_run_epoch() {
+  local f="$BG_DIR/next-run" v
+  [[ -f "$f" ]] || return 1
+  v="$(head -n 1 "$f" 2>/dev/null || true)"
+  [[ "$v" =~ ^[0-9]+$ ]] || return 1
+  printf '%s' "$v"
+}
+
+bg_set_next_run()   { bg_setup_dirs; printf '%s\n' "$1" > "$BG_DIR/next-run"; }
+bg_clear_next_run() { rm -f "$BG_DIR/next-run"; }
+# A retiring worker must not delete the schedule a newer run just published.
+bg_clear_next_run_if_mine() { bg_generation_is_mine "$1" && bg_clear_next_run; return 0; }
+
 # Per-account status, one file per account so concurrent writers never clash.
-#   bg_set_status <num> <email> <PENDING|SUCCESS|FAILED|ALREADY|CANCELLED> [detail]
+# Field 5 is the epoch of the transition, so `csw log` can show when each
+# account was actually refreshed without parsing the log.
+#   bg_set_status <num> <email> <PENDING|RUNNING|SUCCESS|FAILED|SKIPPED|ALREADY|CANCELLED> [detail]
 bg_set_status() {
   bg_setup_dirs
   local detail; detail="$(printf '%s' "${4:-}" | tr '\t\n' '  ')"
-  printf '%s\t%s\t%s\t%s\n' "$1" "$2" "$3" "$detail" > "$BG_STATUS_DIR/$1"
+  printf '%s\t%s\t%s\t%s\t%s\n' "$1" "$2" "$3" "$detail" "$(now_epoch)" > "$BG_STATUS_DIR/$1"
 }
 
 bg_get_status_field() {
@@ -402,16 +430,22 @@ bg_sleep_cancellable() {
 }
 
 # Supersede any in-flight worker: bump the generation, then log every account
-# still pending as cancelled. The old worker is deliberately NOT killed — it
-# notices the new generation and stops on its own at a safe point.
+# still queued as cancelled and clear the old queue. The old worker is
+# deliberately NOT killed — it notices the new generation and stops on its own
+# at a safe point.
+#   bg_cancel_previous <keep_num>
+# keep_num's status file is left alone: the foreground refresh of the account
+# being switched to has already written this run's status there.
 bg_cancel_previous() {
+  local keep_num="${1:-}"
   bg_setup_dirs
   local had_pending=0 num email status
   if [[ -d "$BG_STATUS_DIR" ]]; then
     for f in "$BG_STATUS_DIR"/*; do
       [[ -f "$f" ]] || continue
+      [[ -n "$keep_num" && "$(basename "$f")" == "$keep_num" ]] && continue
       IFS=$'\t' read -r num email status _ < "$f" || continue
-      if [[ "$status" == "PENDING" ]]; then
+      if [[ "$status" == "PENDING" || "$status" == "RUNNING" ]]; then
         had_pending=1
         log_refresh BG "$num" "$email" "Cancelled — superseded by a newer switch."
       fi
@@ -434,6 +468,12 @@ bg_refresh_one() {
     log_refresh BG "$num" "$email" "Skipped — account lock held by another csw process."
     return 0
   fi
+
+  bg_set_status "$num" "$email" "RUNNING" ""
+  # Re-publish the next fire time from *now*, so the schedule shown by
+  # `csw log` stays correct while this refresh is in flight (the value written
+  # before the sleep is in the past by the time we get here).
+  bg_set_next_run "$(( $(now_epoch) + BG_GAP_SECONDS ))"
 
   local creds rc=0 msg_file new_creds
   creds="$(read_account_credentials "$num" "$email")"
@@ -493,24 +533,31 @@ bg_worker_main() {
 
   # Walk the queue this switch wrote. Sorted numerically for stable ordering.
   local queue num email status first=1
+  # The `if` (rather than `[[ ... ]] &&`) and the trailing `|| true` are both
+  # load-bearing: with pipefail, a loop whose last command is a false test
+  # makes the whole command substitution return non-zero, and set -e would
+  # kill this worker silently before it refreshed anything.
   queue="$(
     for f in "$BG_STATUS_DIR"/*; do
       [[ -f "$f" ]] || continue
       IFS=$'\t' read -r num email status _ < "$f" || continue
-      [[ "$status" == "PENDING" ]] && printf '%s\t%s\n' "$num" "$email"
+      if [[ "$status" == "PENDING" ]]; then
+        printf '%s\t%s\n' "$num" "$email"
+      fi
     done | sort -n -k1,1
-  )"
+  )" || true
   [[ -z "$queue" ]] && return 0
 
   while IFS=$'\t' read -r num email; do
     [[ -z "$num" ]] && continue
     bg_generation_is_mine "$gen" || return 0
-    if (( first )); then
-      bg_sleep_cancellable "$BG_INITIAL_DELAY" "$gen" || return 0
-      first=0
-    else
-      bg_sleep_cancellable "$BG_GAP_SECONDS" "$gen" || return 0
-    fi
+    local delay
+    if (( first )); then delay="$BG_INITIAL_DELAY"; first=0; else delay="$BG_GAP_SECONDS"; fi
+    # Publish the next fire time so `csw log` can show a schedule.
+    bg_set_next_run "$(( $(now_epoch) + delay ))"
+    # Superseded: return without touching next-run, which now belongs to the
+    # newer run.
+    bg_sleep_cancellable "$delay" "$gen" || return 0
     # Re-check right before touching a token — the cheapest possible moment
     # to discover we have been superseded.
     bg_generation_is_mine "$gen" || return 0
@@ -520,6 +567,7 @@ bg_worker_main() {
     bg_refresh_one "$num" "$email"
   done <<< "$queue"
 
+  bg_clear_next_run_if_mine "$gen"
   return 0
 }
 
@@ -535,7 +583,7 @@ bg_start_refresh() {
   # Bump the generation BEFORE queueing so any in-flight worker stops before
   # it can act on entries this run is about to rewrite.
   printf '%s\n' "$gen" > "$BG_GEN_FILE"
-  bg_cancel_previous && info "Cancelled pending background refreshes from the previous switch."
+  bg_cancel_previous "$target_num" && info "Cancelled pending background refreshes from the previous switch."
 
   while IFS= read -r num; do
     [[ -z "$num" || "$num" == "$target_num" ]] && continue
@@ -558,9 +606,14 @@ bg_start_refresh() {
 
   if (( queued == 0 )); then
     rm -f "$BG_PID_FILE"
+    bg_clear_next_run
     info "No accounts need a background refresh."
     return 0
   fi
+
+  # Publish the first fire time up front so `csw log` shows a schedule even
+  # before the worker has taken its first breath.
+  bg_set_next_run "$(( $(now_epoch) + BG_INITIAL_DELAY ))"
 
   local self; self="$(script_path)"
   nohup /bin/bash "$self" --bg-refresh "$gen" >/dev/null 2>&1 &
@@ -1146,6 +1199,8 @@ perform_switch() {
   # (same behaviour as before — works until the stored accessToken expires).
   # Clear log file — csw log only shows the current switch run
   printf '' > "$LOG_FILE"
+  bg_setup_dirs
+  printf '%s\n' "$(now_epoch)" > "$BG_DIR/last-switch"
 
   step "Refreshing OAuth token for Account-$target_account..."
   # Take the account lock so a background worker from an earlier switch can
@@ -1171,15 +1226,18 @@ perform_switch() {
       target_creds="$refreshed_creds"
       write_account_credentials "$target_account" "$target_email" "$refreshed_creds"
       record_refresh_time "$target_account"
+      bg_set_status "$target_account" "$target_email" "SUCCESS" ""
       log_refresh FG "$target_account" "$target_email" "Token refreshed successfully."
       success "Token refreshed successfully — new access token applied and saved to backup."
       ;;
     1)
+      bg_set_status "$target_account" "$target_email" "SKIPPED" "No refreshToken stored"
       log_refresh FG "$target_account" "$target_email" "Skipped — no refreshToken in stored credentials."
       warn "Token refresh skipped — no refreshToken found in stored credentials."
       info "The account will use its existing access token (valid until it expires)."
       ;;
     2)
+      bg_set_status "$target_account" "$target_email" "FAILED" "Network error"
       log_refresh FG "$target_account" "$target_email" "Failed — network error (curl failed or timed out)."
       warn "Token refresh failed — network error (no internet or server unreachable)."
       info "Using stored credentials as-is. If the access token has expired, re-login with: claude login"
@@ -1196,6 +1254,7 @@ perform_switch() {
       local log_detail="Failed — HTTP ${http_status:-unknown} from Claude server."
       [[ -n "$retry_after" ]] && log_detail="$log_detail Retry after ${retry_after}s."
       [[ -n "$requests_reset" ]] && log_detail="$log_detail Rate limit resets at ${requests_reset}."
+      bg_set_status "$target_account" "$target_email" "FAILED" "HTTP ${http_status:-unknown}${retry_after:+, retry after ${retry_after}s}"
       log_refresh FG "$target_account" "$target_email" "$log_detail"
       warn "Token refresh failed — HTTP $http_status from Claude server."
       if [[ -n "$raw_response" ]]; then
@@ -1214,11 +1273,13 @@ perform_switch() {
       info "Re-login with: claude login"
       ;;
     4)
+      bg_set_status "$target_account" "$target_email" "FAILED" "Invalid server response"
       log_refresh FG "$target_account" "$target_email" "Failed — invalid or empty response (missing access_token or malformed JSON)."
       warn "Token refresh failed — server returned an invalid or empty response."
       info "Using stored credentials as-is. If login fails, re-authenticate with: claude login"
       ;;
     5)
+      bg_set_status "$target_account" "$target_email" "SKIPPED" "Locked by another csw process"
       info "Using stored credentials as-is (refresh skipped — account was locked)."
       ;;
   esac
@@ -1279,84 +1340,245 @@ perform_switch() {
   echo ""
 }
 
-# Colored status label for one account in the per-account summary.
-_log_status_line() {
-  local num="$1" email="$2" status="$3" detail="$4"
-  local label
+# -----------------------------
+# csw log — status table
+# -----------------------------
+_repeat() {
+  local n="$1" ch="$2" out="" i=0
+  while (( i < n )); do out="$out$ch"; i=$(( i + 1 )); done
+  printf '%s' "$out"
+}
+
+# Pad a plain-text cell to a width, then colorize. Colors are applied AFTER
+# measuring so escape bytes never skew the column alignment.
+_cell() {
+  local text="$1" width="$2" color="${3:-}"
+  local pad=$(( width - ${#text} ))
+  (( pad < 0 )) && pad=0
+  printf '%s%s%s%s' "$color" "$text" "${color:+$RESET}" "$(_repeat "$pad" ' ')"
+}
+
+# One horizontal rule for the status table. $1/$2/$3 are the left, junction
+# and right glyphs; the rest are column widths.
+_table_rule() {
+  local left="$1" mid="$2" right="$3"; shift 3
+  local out="" w first=1
+  for w in "$@"; do
+    if (( first )); then first=0; else out="${out}${mid}"; fi
+    # Braces are required: a bare $out followed by a multibyte glyph gets
+    # parsed as part of the variable name.
+    out="${out}─$(_repeat "$w" "─")─"
+  done
+  printf '  %s%s%s%s%s' "$DIM" "$left" "$out" "$right" "$RESET"
+}
+
+# Print one table row. Relies on $bar from the calling scope (bash dynamic
+# scoping) so every row shares the caller's separator styling.
+_print_row() {
+  printf '  %s %s %s %s %s %s %s %s %s %s %s %s %s\n' \
+    "$bar" "$1" "$bar" "$2" "$bar" "$3" "$bar" "$4" "$bar" "$5" "$bar" "$6" "$bar"
+}
+
+# Map a status to its display word + color. Sets _st_word / _st_color / _st_note.
+_status_display() {
+  local status="$1" detail="$2" worker_alive="$3"
+  _st_note="$detail"
   case "$status" in
-    SUCCESS)   label="${GREEN}Success${RESET} — token refreshed" ;;
+    SUCCESS)   _st_word="Success";   _st_color="$GREEN" ;;
+    RUNNING)   _st_word="Refreshing";_st_color="$CYAN";   _st_note="in progress" ;;
     PENDING)
-      if bg_worker_alive; then
-        label="${YELLOW}Pending${RESET} — queued for background refresh"
+      if (( worker_alive )); then
+        _st_word="Pending"; _st_color="$YELLOW"
       else
-        label="${YELLOW}Pending${RESET} — ${RED}stalled${RESET} (worker not running; run csw switch again)"
+        _st_word="Stalled"; _st_color="$RED"; _st_note="worker gone; run csw switch"
       fi
       ;;
-    ALREADY)   label="${CYAN}Already refreshed${RESET} — ${detail:-recently}, skipped" ;;
-    SKIPPED)   label="${YELLOW}Skipped${RESET}${detail:+ — $detail}" ;;
-    FAILED)    label="${RED}Failed${RESET}${detail:+ — $detail}" ;;
-    CANCELLED) label="${DIM}Cancelled${RESET} — superseded by a newer switch" ;;
-    *)         label="$status${detail:+ — $detail}" ;;
+    ALREADY)   _st_word="Fresh";     _st_color="$BLUE";   _st_note="refreshed ${detail:-recently}" ;;
+    SKIPPED)   _st_word="Skipped";   _st_color="$YELLOW" ;;
+    FAILED)    _st_word="Failed";    _st_color="$RED" ;;
+    CANCELLED) _st_word="Cancelled"; _st_color="$DIM";    _st_note="superseded" ;;
+    *)         _st_word="${status:-Not queued}"; _st_color="$DIM" ;;
   esac
-  printf "  %sAccount-%s (%s)%s: %s\n" "$BOLD" "$num" "$email" "$RESET" "$label"
 }
 
 cmd_log() {
+  local show_raw=0
+  case "${1:-}" in
+    -v|--verbose|--full|-a|--all) show_raw=1 ;;
+    "") ;;
+    *) warn "Unknown option '$1' — showing the status table."; dimln "  Raw log entries: csw log -v" ;;
+  esac
+
   local have_log=0 have_status=0
   [[ -f "$LOG_FILE" && -s "$LOG_FILE" ]] && have_log=1
   [[ -d "$BG_STATUS_DIR" ]] && [[ -n "$(ls -A "$BG_STATUS_DIR" 2>/dev/null || true)" ]] && have_status=1
   if (( have_log == 0 && have_status == 0 )); then
-    info "No logs found. Logs are created when token refresh runs during switch."
+    info "No refresh activity recorded yet. Run: csw switch"
+    return 0
+  fi
+  if [[ ! -f "$SEQUENCE_FILE" ]]; then
+    info "No managed accounts yet. Run: csw add-account"
     return 0
   fi
 
-  title "Token Refresh Status (last switch):"
+  local worker_alive=0; bg_worker_alive && worker_alive=1
+  local active_num next_run now last_switch
+  active_num="$(jq -r '.activeAccountNumber // empty | tostring' "$SEQUENCE_FILE" 2>/dev/null || true)"
+  now="$(now_epoch)"
+  next_run="$(bg_next_run_epoch || true)"
+  last_switch="$(head -n 1 "$BG_DIR/last-switch" 2>/dev/null || true)"
+
+  # ---- Pass 1: gather rows, measure column widths ----
+  # Parallel arrays (bash 3.2 has no associative arrays).
+  local -a r_num r_email r_mode r_word r_color r_note r_when
+  local col_acct=7 col_status=6 col_note=6 col_num=1
+  local acct_num acct_email status detail ts pending_seen=0 queued_total=0 running_total=0
+  local _st_word _st_color _st_note
+
+  while IFS= read -r acct_num; do
+    acct_email="$(jq -r --arg num "$acct_num" '.accounts[$num].email // empty' "$SEQUENCE_FILE" 2>/dev/null || true)"
+    [[ -z "$acct_email" ]] && continue
+
+    status="$(bg_get_status_field "$acct_num" 3 2>/dev/null || true)"
+    detail="$(bg_get_status_field "$acct_num" 4 2>/dev/null || true)"
+    ts="$(bg_get_status_field "$acct_num" 5 2>/dev/null || true)"
+
+    # An ALREADY row was skipped *because* it was refreshed earlier, so its
+    # "When" is that earlier refresh — not when this switch wrote the status.
+    if [[ "$status" == "ALREADY" ]]; then
+      local prev_ts
+      prev_ts="$(head -n 1 "$BG_TS_DIR/$acct_num" 2>/dev/null || true)"
+      [[ "$prev_ts" =~ ^[0-9]+$ ]] && ts="$prev_ts"
+    fi
+
+    _status_display "$status" "$detail" "$worker_alive"
+
+    # "When": completed rows show when it happened; queued rows show the
+    # projected fire time (next_run + position * gap), matching the worker's
+    # own pacing.
+    local when="-"
+    if [[ "$status" == "PENDING" ]]; then
+      # Counted whether or not the worker is alive, so a stalled queue is
+      # never reported as settled.
+      queued_total=$(( queued_total + 1 ))
+      if (( worker_alive )) && [[ -n "$next_run" ]]; then
+        local eta=$(( next_run + pending_seen * BG_GAP_SECONDS ))
+        (( eta < now )) && eta=$now
+        when="$(epoch_to_hms "$eta")"
+        _st_note="due $(human_until $(( eta - now )))"
+      elif (( worker_alive )); then
+        when="queued"
+      fi
+      pending_seen=$(( pending_seen + 1 ))
+    elif [[ "$status" == "RUNNING" ]]; then
+      running_total=$(( running_total + 1 ))
+      when="now"
+    elif [[ "$ts" =~ ^[0-9]+$ ]]; then
+      when="$(epoch_to_hms "$ts")"
+      [[ -z "$_st_note" ]] && _st_note="$(human_duration $(( now - ts )))"
+    fi
+
+    r_num[${#r_num[@]}]="$acct_num"
+    r_email[${#r_email[@]}]="$acct_email"
+    if [[ "$acct_num" == "$active_num" ]]; then
+      r_mode[${#r_mode[@]}]="fg"
+    else
+      r_mode[${#r_mode[@]}]="bg"
+    fi
+    r_word[${#r_word[@]}]="$_st_word"
+    r_color[${#r_color[@]}]="$_st_color"
+    r_note[${#r_note[@]}]="$_st_note"
+    r_when[${#r_when[@]}]="$when"
+
+    (( ${#acct_num} > col_num ))     && col_num=${#acct_num}
+    (( ${#acct_email} > col_acct ))  && col_acct=${#acct_email}
+    (( ${#_st_word}  > col_status )) && col_status=${#_st_word}
+    (( ${#_st_note}  > col_note ))   && col_note=${#_st_note}
+  done < <(jq -r '.sequence[]? | tostring' "$SEQUENCE_FILE" 2>/dev/null || true)
+
+  if (( ${#r_num[@]} == 0 )); then
+    info "No managed accounts in the switch sequence."
+    return 0
+  fi
+
+  # ---- Header ----
+  local header="Token refresh — last switch"
+  if [[ "$last_switch" =~ ^[0-9]+$ ]]; then
+    header="$header $(epoch_to_hms "$last_switch") ($(human_duration $(( now - last_switch ))))"
+  fi
+  echo ""
+  title "  $header"
   echo ""
 
-  # The account switched to is refreshed in the foreground, so its status comes
-  # from the [FG] log line. Every other account is driven by the background
-  # worker, whose live status lives in $BG_STATUS_DIR.
-  if [[ -f "$SEQUENCE_FILE" ]]; then
-    local active_num acct_num acct_email fg_entry status detail
-    active_num="$(jq -r '.activeAccountNumber // empty | tostring' "$SEQUENCE_FILE" 2>/dev/null || true)"
-    while IFS= read -r acct_num; do
-      acct_email="$(jq -r --arg num "$acct_num" '.accounts[$num].email // empty' "$SEQUENCE_FILE" 2>/dev/null || true)"
-      [[ -z "$acct_email" ]] && continue
+  # ---- Table ----
+  # Cell text is kept ASCII-only: widths are measured with ${#...}, which
+  # counts bytes in a C locale, so a multibyte glyph inside a padded cell
+  # would skew the columns. Box-drawing glyphs sit outside the cells.
+  local col_mode=4 col_when=8
+  local bar="${DIM}│${RESET}"
+  local sep_top sep_mid sep_bot
+  sep_top="$(_table_rule "┌" "┬" "┐" "$col_num" "$col_acct" "$col_mode" "$col_status" "$col_when" "$col_note")"
+  sep_mid="$(_table_rule "├" "┼" "┤" "$col_num" "$col_acct" "$col_mode" "$col_status" "$col_when" "$col_note")"
+  sep_bot="$(_table_rule "└" "┴" "┘" "$col_num" "$col_acct" "$col_mode" "$col_status" "$col_when" "$col_note")"
 
-      if [[ "$acct_num" == "$active_num" ]]; then
-        # `|| true`: pipefail would abort on an account with no log entry
-        fg_entry="$(grep "\[FG\] Account-$acct_num ($acct_email)" "$LOG_FILE" 2>/dev/null | tail -1 || true)"
-        if [[ -n "$fg_entry" ]]; then
-          printf "  %sAccount-%s (%s)%s: %s(active, foreground)%s %s\n" \
-            "$BOLD" "$acct_num" "$acct_email" "$RESET" "$DIM" "$RESET" \
-            "${fg_entry#*): }"
-        else
-          dimln "  Account-$acct_num ($acct_email): (active) No refresh recorded for the last switch."
-        fi
-        continue
-      fi
+  printf '%s\n' "$sep_top"
+  _print_row \
+    "$(_cell '#'       $col_num    "$BOLD")" \
+    "$(_cell 'Account' $col_acct   "$BOLD")" \
+    "$(_cell 'Mode'    $col_mode   "$BOLD")" \
+    "$(_cell 'Status'  $col_status "$BOLD")" \
+    "$(_cell 'When'    $col_when   "$BOLD")" \
+    "$(_cell 'Detail'  $col_note   "$BOLD")"
+  printf '%s\n' "$sep_mid"
 
-      status="$(bg_get_status_field "$acct_num" 3 2>/dev/null || true)"
-      detail="$(bg_get_status_field "$acct_num" 4 2>/dev/null || true)"
-      if [[ -z "$status" ]]; then
-        dimln "  Account-$acct_num ($acct_email): Not queued for refresh."
-      else
-        _log_status_line "$acct_num" "$acct_email" "$status" "$detail"
-      fi
-    done < <(jq -r '.sequence[]? | tostring' "$SEQUENCE_FILE" 2>/dev/null || true)
-    echo ""
-  fi
-
-  if bg_worker_alive; then
-    info "Background worker is running — re-run 'csw log' to see progress."
-  fi
+  local i=0 mode_color
+  while (( i < ${#r_num[@]} )); do
+    mode_color="$DIM"
+    [[ "${r_mode[$i]}" == "fg" ]] && mode_color="$MAGENTA"
+    _print_row \
+      "$(_cell "${r_num[$i]}"   $col_num    "$BOLD")" \
+      "$(_cell "${r_email[$i]}" $col_acct   "")" \
+      "$(_cell "${r_mode[$i]}"  $col_mode   "$mode_color")" \
+      "$(_cell "${r_word[$i]}"  $col_status "${r_color[$i]}")" \
+      "$(_cell "${r_when[$i]}"  $col_when   "$DIM")" \
+      "$(_cell "${r_note[$i]}"  $col_note   "$DIM")"
+    i=$(( i + 1 ))
+  done
+  printf '%s\n' "$sep_bot"
   echo ""
 
-  if (( have_log )); then
-    title "Log Entries:"
-    cat "$LOG_FILE"
-    echo ""
+  # ---- Schedule summary ----
+  if (( queued_total == 0 && running_total > 0 )); then
+    printf '  %sRefreshing now%s %s— last account in flight%s\n' "$CYAN" "$RESET" "$DIM" "$RESET"
+  elif (( queued_total > 0 )) && (( worker_alive )); then
+    if [[ -n "$next_run" ]]; then
+      local nxt=$next_run
+      (( nxt < now )) && nxt=$now
+      local done_at=$(( nxt + (queued_total - 1) * BG_GAP_SECONDS ))
+      printf '  %sNext refresh%s   %s  %s(%s)%s\n' \
+        "$BOLD" "$RESET" "$(epoch_to_hms "$nxt")" "$DIM" "$(human_until $(( nxt - now )))" "$RESET"
+      printf '  %sAll done by%s    %s  %s(%s left, %ss apart)%s\n' \
+        "$BOLD" "$RESET" "$(epoch_to_hms "$done_at")" "$DIM" "$queued_total" "$BG_GAP_SECONDS" "$RESET"
+    else
+      printf '  %sNext refresh%s   starting up\n' "$BOLD" "$RESET"
+    fi
+  elif (( queued_total > 0 )); then
+    printf '  %s%s account(s) still queued but the worker is gone%s — run: %scsw switch%s\n' \
+      "$RED" "$queued_total" "$RESET" "$BOLD" "$RESET"
+  else
+    printf '  %sAll accounts settled%s %s— nothing queued%s\n' "$GREEN" "$RESET" "$DIM" "$RESET"
   fi
+
+  if (( show_raw )); then
+    echo ""
+    title "  Log entries"
+    echo ""
+    while IFS= read -r line; do dimln "  $line"; done < "$LOG_FILE"
+  elif (( have_log )); then
+    echo ""
+    dimln "  Full log: csw log -v"
+  fi
+  echo ""
 }
 
 show_usage() {

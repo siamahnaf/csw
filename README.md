@@ -25,8 +25,10 @@ It only switches **authentication** — your **themes, settings, preferences, an
     left alone instead of being queued again
   - Starting a new switch cancels any refreshes still pending from the previous
     one and queues a fresh run
-- **Refresh logs**: `csw log` shows live per-account status — `Pending`,
-  `Success`, `Already refreshed`, `Skipped`, or `Failed` with the reason
+- **Live status table**: `csw log` shows one row per account — mode (`fg`/`bg`),
+  status (`Success`, `Pending`, `Refreshing`, `Fresh`, `Skipped`, `Failed`),
+  when it happened, and — for queued accounts — the projected refresh time plus
+  when the whole queue finishes. `csw log -v` appends the raw log lines.
 - **Cross-platform**: macOS, Linux, WSL, Windows
 - **Secure storage**
   - **macOS**: credentials stored in **Keychain**
@@ -98,9 +100,12 @@ csw switch-to user2@example.com
 csw remove-account 2
 csw remove-account user2@example.com
 
-# View refresh status + logs from the last switch
+# Status table for the last switch: per-account state, next refresh time, ETA
 # (re-run while a background refresh is in flight to watch Pending -> Success)
 csw log
+
+# Same table plus the raw log lines
+csw log -v
 
 # Help
 csw -help
@@ -182,10 +187,11 @@ csw switch                # both accounts now refresh cleanly
 > `Failed — Refreshed but could not save` in `csw log`, that account's stored
 > token is the invalidated one and it needs `claude login`.
 
-### Background refreshes are stuck on `Pending`
+### Background refreshes are stuck
 
-`csw log` marks an account `Pending — stalled` when the worker process is gone
-(a reboot, a killed terminal). Run `csw switch` again to queue a fresh run.
+`csw log` shows `Stalled` (instead of `Pending`) when accounts are still queued
+but the worker process is gone — a reboot, or a killed terminal. Run
+`csw switch` again to queue a fresh run.
 
 ---
 
