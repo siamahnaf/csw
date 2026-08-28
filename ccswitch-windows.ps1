@@ -3,7 +3,7 @@
 
 $ErrorActionPreference = "Stop"
 
-$CSW_VERSION        = "2.6.2"
+$CSW_VERSION        = "2.7.0"
 $CSW_REPO           = "siamahnaf/csw"
 $CSW_DEFAULT_BRANCH = "main"
 
@@ -13,6 +13,24 @@ $LOG_FILE        = Join-Path $BACKUP_DIR "csw.log"
 $CREDS_DIR       = Join-Path $BACKUP_DIR "credentials"
 $CONFIGS_DIR     = Join-Path $BACKUP_DIR "configs"
 $LIVE_CREDS_PATH = Join-Path $env:USERPROFILE ".claude\.credentials.json"
+
+# Background refresh state
+$BG_DIR          = Join-Path $BACKUP_DIR "bg"
+$BG_PID_FILE     = Join-Path $BG_DIR "worker.pid"
+$BG_GEN_FILE     = Join-Path $BG_DIR "generation"
+$BG_STATUS_DIR   = Join-Path $BG_DIR "status"
+$BG_TS_DIR       = Join-Path $BG_DIR "last-refresh"
+$BG_LOCK_DIR     = Join-Path $BG_DIR "locks"
+
+# Gap between consecutive background refreshes (rate-limit friendly)
+$BG_GAP_SECONDS       = 60
+# Delay before the first background refresh, so it never overlaps the
+# foreground refresh of the account being switched to
+$BG_INITIAL_DELAY     = 5
+# An account refreshed by csw within this window is left alone (6 hours)
+$REFRESH_FRESH_WINDOW = 21600
+# How long to wait for another process to release an account lock
+$BG_LOCK_WAIT         = 15
 
 # ---------------------------------------------------------------------------
 # Output helpers
@@ -24,6 +42,16 @@ function Write-CSWError   { param([string]$Msg) Write-Host "[ERR]  $Msg" -Foregr
 function Write-CSWStep    { param([string]$Msg) Write-Host "==>  $Msg" -ForegroundColor Blue }
 function Write-CSWTitle   { param([string]$Msg) Write-Host $Msg -ForegroundColor Magenta }
 function Write-CSWDim     { param([string]$Msg) Write-Host "  $Msg" -ForegroundColor DarkGray }
+
+# Append one refresh outcome to the log. Every refresh attempt logs exactly one
+# line - success or failure - so `csw log` is never empty after a switch.
+function Write-RefreshLog {
+    param([string]$Scope, [string]$Num, [string]$Email, [string]$Message)
+    $ts = (Get-Date).ToString("yyyy-MM-dd HH:mm:ss")
+    try {
+        Add-Content -Path $LOG_FILE -Value "[$ts] [$Scope] Account-${Num} (${Email}): $Message"
+    } catch {}
+}
 
 # ---------------------------------------------------------------------------
 # Platform guard
@@ -318,14 +346,12 @@ function Get-CurrentManagedAccountNum {
 # OAuth token refresh
 # ---------------------------------------------------------------------------
 function Invoke-OAuthRefresh {
-    param([string]$Credentials, [string]$AccountNum, [string]$Email)
-
-    $ts = (Get-Date).ToString("yyyy-MM-dd HH:mm:ss")
+    param([string]$Credentials, [string]$AccountNum, [string]$Email, [string]$Scope = "FG")
 
     $refreshToken = ""
     try { $refreshToken = ($Credentials | ConvertFrom-Json).claudeAiOauth.refreshToken } catch {}
     if ([string]::IsNullOrEmpty($refreshToken)) {
-        Add-Content -Path $LOG_FILE -Value "[$ts] [FG] Account-${AccountNum} (${Email}): No refreshToken - skipped."
+        Write-RefreshLog $Scope $AccountNum $Email "No refreshToken - skipped."
         return @{ Status = 1; Credentials = $Credentials }
     }
 
@@ -357,11 +383,11 @@ function Invoke-OAuthRefresh {
             } catch {}
             $respHeaders = $_.Exception.Response.Headers
         } else {
-            Add-Content -Path $LOG_FILE -Value "[$ts] [FG] Account-${AccountNum} (${Email}): Network error - $($_.Exception.Message)"
+            Write-RefreshLog $Scope $AccountNum $Email "Network error - $($_.Exception.Message)"
             return @{ Status = 2; Credentials = $Credentials }
         }
     } catch {
-        Add-Content -Path $LOG_FILE -Value "[$ts] [FG] Account-${AccountNum} (${Email}): Network error - $($_.Exception.Message)"
+        Write-RefreshLog $Scope $AccountNum $Email "Network error - $($_.Exception.Message)"
         return @{ Status = 2; Credentials = $Credentials }
     }
 
@@ -369,7 +395,7 @@ function Invoke-OAuthRefresh {
         $retryAfter = try { if ($respHeaders) { $respHeaders["retry-after"] } else { "" } } catch { "" }
         $rateReset  = try { if ($respHeaders) { $respHeaders["anthropic-ratelimit-requests-reset"] } else { "" } } catch { "" }
         $rateRemain = try { if ($respHeaders) { $respHeaders["anthropic-ratelimit-requests-remaining"] } else { "" } } catch { "" }
-        Add-Content -Path $LOG_FILE -Value "[$ts] [FG] Account-${AccountNum} (${Email}): Server error HTTP $statusCode"
+        Write-RefreshLog $Scope $AccountNum $Email "Server error HTTP $statusCode"
         return @{ Status = 3; Credentials = $Credentials; HttpStatus = $statusCode
                   Body = $respBody; RetryAfter = $retryAfter; RateReset = $rateReset; RateRemain = $rateRemain }
     }
@@ -380,12 +406,12 @@ function Invoke-OAuthRefresh {
         $expiresIn   = if ($ro.expires_in) { [long]$ro.expires_in } else { 28800 }
         $newRT       = $ro.refresh_token
     } catch {
-        Add-Content -Path $LOG_FILE -Value "[$ts] [FG] Account-${AccountNum} (${Email}): Invalid response body"
+        Write-RefreshLog $Scope $AccountNum $Email "Invalid response body"
         return @{ Status = 4; Credentials = $Credentials }
     }
 
     if ([string]::IsNullOrEmpty($accessToken)) {
-        Add-Content -Path $LOG_FILE -Value "[$ts] [FG] Account-${AccountNum} (${Email}): Missing access_token in response"
+        Write-RefreshLog $Scope $AccountNum $Email "Missing access_token in response"
         return @{ Status = 4; Credentials = $Credentials }
     }
 
@@ -399,11 +425,11 @@ function Invoke-OAuthRefresh {
         $obj.claudeAiOauth.refreshToken = $newRT
         $updated = $obj | ConvertTo-Json -Depth 20 -Compress
     } catch {
-        Add-Content -Path $LOG_FILE -Value "[$ts] [FG] Account-${AccountNum} (${Email}): Failed to patch credentials object"
+        Write-RefreshLog $Scope $AccountNum $Email "Failed to patch credentials object"
         return @{ Status = 4; Credentials = $Credentials }
     }
 
-    Add-Content -Path $LOG_FILE -Value "[$ts] [FG] Account-${AccountNum} (${Email}): Token refreshed successfully."
+    Write-RefreshLog $Scope $AccountNum $Email "Token refreshed successfully."
     return @{ Status = 0; Credentials = $updated }
 }
 
@@ -438,65 +464,316 @@ function Compare-SemVer {
 }
 
 # ---------------------------------------------------------------------------
-# Background refresh (Start-Job so it survives main script exit)
+# Background refresh
+#
+# Inactive accounts are refreshed by a detached worker process, one at a time
+# with a gap between each, so we never burst requests at the OAuth server.
+#
+# Two invariants keep this safe against Anthropic's rotating refresh tokens
+# (where refreshing with an already-used token revokes the whole token family):
+#
+#   1. Per-account lock file opened with CreateNew — no two processes ever
+#      refresh the same account concurrently, so the same refresh token is
+#      never presented twice.
+#   2. Generation counter — a superseded worker stops cooperatively at its next
+#      checkpoint instead of being killed, so it can never be terminated
+#      mid-refresh holding a rotated-but-unsaved token.
+#
+# The worker is launched with Start-Process (a real detached process). Do NOT
+# use Start-Job here: background jobs are owned by the launching PowerShell
+# session and die the moment csw exits.
 # ---------------------------------------------------------------------------
-function Start-BackgroundRefresh {
-    param([string]$ActiveNum)
-    $bgScript = {
-        param($SeqFile, $ActiveNum, $CredsDir, $LogFile)
-        Add-Type -AssemblyName System.Security
-        Start-Sleep -Seconds 5
-        if (-not (Test-Path $SeqFile)) { return }
-        $seq   = Get-Content $SeqFile -Raw | ConvertFrom-Json
-        $first = $true
-        foreach ($prop in $seq.accounts.PSObject.Properties) {
-            if ($prop.Name -eq $ActiveNum) { continue }
-            $num   = $prop.Name
-            $email = $prop.Value.email
-            if (-not $first) { Start-Sleep -Seconds 120 }
-            $first = $false
-            $encFile = Join-Path $CredsDir ".csw-cred-${num}-${email}.enc"
-            if (-not (Test-Path $encFile)) { continue }
-            $ts = (Get-Date).ToString("yyyy-MM-dd HH:mm:ss")
+function Initialize-BgDirs {
+    foreach ($d in @($BG_DIR, $BG_STATUS_DIR, $BG_TS_DIR, $BG_LOCK_DIR)) {
+        if (-not (Test-Path $d)) { New-Item -ItemType Directory -Path $d -Force | Out-Null }
+    }
+}
+
+function Get-NowEpoch { return [long][DateTimeOffset]::UtcNow.ToUnixTimeSeconds() }
+
+# Stamp the time of a successful refresh (drives the "Already refreshed" rule).
+function Set-RefreshStamp {
+    param([string]$Num)
+    Initialize-BgDirs
+    Set-Content -Path (Join-Path $BG_TS_DIR $Num) -Value (Get-NowEpoch) -Encoding UTF8 -Force
+}
+
+# Seconds since csw last refreshed this account, or $null if never.
+function Get-RefreshAgeSeconds {
+    param([string]$Num)
+    $f = Join-Path $BG_TS_DIR $Num
+    if (-not (Test-Path $f)) { return $null }
+    try {
+        $raw = (Get-Content $f -Raw).Trim()
+        if ($raw -notmatch '^\d+$') { return $null }
+        return [long](Get-NowEpoch) - [long]$raw
+    } catch { return $null }
+}
+
+function Format-Duration {
+    param([long]$Seconds)
+    if ($Seconds -lt 60)   { return "${Seconds}s ago" }
+    if ($Seconds -lt 3600) { return "$([math]::Floor($Seconds / 60))m ago" }
+    return "$([math]::Floor($Seconds / 3600))h $([math]::Floor(($Seconds % 3600) / 60))m ago"
+}
+
+# Per-account status, one file per account so concurrent writers never clash.
+function Set-BgStatus {
+    param([string]$Num, [string]$Email, [string]$Status, [string]$Detail = "")
+    Initialize-BgDirs
+    $clean = ($Detail -replace "`t|`r|`n", " ")
+    Set-Content -Path (Join-Path $BG_STATUS_DIR $Num) `
+        -Value ("{0}`t{1}`t{2}`t{3}" -f $Num, $Email, $Status, $clean) -Encoding UTF8 -Force
+}
+
+function Get-BgStatus {
+    param([string]$Num)
+    $f = Join-Path $BG_STATUS_DIR $Num
+    if (-not (Test-Path $f)) { return $null }
+    try {
+        $line = (Get-Content $f -TotalCount 1)
+        if ([string]::IsNullOrWhiteSpace($line)) { return $null }
+        $p = $line -split "`t"
+        return [pscustomobject]@{
+            Num    = $p[0]
+            Email  = if ($p.Count -gt 1) { $p[1] } else { "" }
+            Status = if ($p.Count -gt 2) { $p[2] } else { "" }
+            Detail = if ($p.Count -gt 3) { $p[3] } else { "" }
+        }
+    } catch { return $null }
+}
+
+# ---- Per-account locks (CreateNew is atomic at the OS level) ---------------
+function Lock-Account {
+    param([string]$Num, [int]$TimeoutSec = 0)
+    Initialize-BgDirs
+    $lock   = Join-Path $BG_LOCK_DIR "$Num.lock"
+    $waited = 0
+    while ($true) {
+        try {
+            $fs = [System.IO.File]::Open($lock, [System.IO.FileMode]::CreateNew,
+                                                [System.IO.FileAccess]::Write,
+                                                [System.IO.FileShare]::None)
             try {
-                $b64   = (Get-Content $encFile -Raw).Trim()
-                $encB  = [System.Convert]::FromBase64String($b64)
-                $bytes = [System.Security.Cryptography.ProtectedData]::Unprotect(
-                             $encB, $null,
-                             [System.Security.Cryptography.DataProtectionScope]::CurrentUser)
-                $obj   = [System.Text.Encoding]::UTF8.GetString($bytes) | ConvertFrom-Json
-                $rt    = $obj.claudeAiOauth.refreshToken
-                if ([string]::IsNullOrEmpty($rt)) {
-                    Add-Content $LogFile "[$ts] [BG] Account-${num} (${email}): No refreshToken - skipped."
-                    continue
-                }
-                $hdrs = @{
-                    "Content-Type"   = "application/x-www-form-urlencoded"
-                    "User-Agent"     = "claude-cli/0.0.0"
-                    "anthropic-beta" = "oauth-2025-04-20"
-                }
-                $body = "grant_type=refresh_token&refresh_token=$([Uri]::EscapeDataString($rt))&client_id=9d1c250a-e61b-44d9-88ed-5944d1962f5e"
-                $r    = Invoke-WebRequest -Uri "https://platform.claude.com/v1/oauth/token" `
-                        -Method Post -Headers $hdrs -Body $body -TimeoutSec 15 -UseBasicParsing -ErrorAction Stop
-                $ro   = $r.Content | ConvertFrom-Json
-                $ei   = if ($ro.expires_in) { [long]$ro.expires_in } else { 28800 }
-                $obj.claudeAiOauth.accessToken  = $ro.access_token
-                if ($ro.refresh_token) { $obj.claudeAiOauth.refreshToken = $ro.refresh_token }
-                $obj.claudeAiOauth.expiresAt = [DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds() + ($ei * 1000)
-                $newJson  = $obj | ConvertTo-Json -Depth 20 -Compress
-                $newBytes = [System.Text.Encoding]::UTF8.GetBytes($newJson)
-                $newEnc   = [System.Security.Cryptography.ProtectedData]::Protect(
-                                $newBytes, $null,
-                                [System.Security.Cryptography.DataProtectionScope]::CurrentUser)
-                Set-Content -Path $encFile -Value ([System.Convert]::ToBase64String($newEnc)) -Encoding UTF8 -Force
-                Add-Content $LogFile "[$ts] [BG] Account-${num} (${email}): Token refreshed successfully."
-            } catch {
-                $sc = if ($_.Exception.Response) { [int]$_.Exception.Response.StatusCode } else { "ERR" }
-                Add-Content $LogFile "[$ts] [BG] Account-${num} (${email}): Failed - HTTP $sc $($_.Exception.Message)"
+                $bytes = [System.Text.Encoding]::UTF8.GetBytes("$PID")
+                $fs.Write($bytes, 0, $bytes.Length)
+            } finally { $fs.Close() }
+            return $true
+        } catch {
+            # Reclaim a lock whose owner died (crash, reboot, task kill)
+            $owner = ""
+            try { $owner = (Get-Content $lock -Raw -ErrorAction Stop).Trim() } catch {}
+            $ownerLives = $false
+            if ($owner -match '^\d+$') {
+                try { $ownerLives = $null -ne (Get-Process -Id ([int]$owner) -ErrorAction Stop) } catch { $ownerLives = $false }
             }
+            if (-not $ownerLives) {
+                Remove-Item $lock -Force -ErrorAction SilentlyContinue
+                continue
+            }
+            if ($waited -ge $TimeoutSec) { return $false }
+            Start-Sleep -Seconds 1
+            $waited++
         }
     }
-    Start-Job -ScriptBlock $bgScript -ArgumentList @($SEQUENCE_FILE, $ActiveNum, $CREDS_DIR, $LOG_FILE) | Out-Null
+}
+
+function Unlock-Account {
+    param([string]$Num)
+    Remove-Item (Join-Path $BG_LOCK_DIR "$Num.lock") -Force -ErrorAction SilentlyContinue
+}
+
+# ---- Generation / cancellation --------------------------------------------
+function Get-BgGeneration {
+    if (-not (Test-Path $BG_GEN_FILE)) { return "" }
+    try { return (Get-Content $BG_GEN_FILE -Raw).Trim() } catch { return "" }
+}
+
+function Test-BgGenerationMine {
+    param([string]$Gen)
+    return ((Get-BgGeneration) -eq $Gen)
+}
+
+function Test-BgWorkerAlive {
+    if (-not (Test-Path $BG_PID_FILE)) { return $false }
+    try {
+        $p = (Get-Content $BG_PID_FILE -Raw).Trim()
+        if ($p -notmatch '^\d+$') { return $false }
+        return $null -ne (Get-Process -Id ([int]$p) -ErrorAction Stop)
+    } catch { return $false }
+}
+
+# Interruptible sleep: polls the generation file so a superseded worker stops
+# within a second instead of sitting out a full gap.
+function Start-BgSleepCancellable {
+    param([int]$Seconds, [string]$Gen)
+    for ($i = 0; $i -lt $Seconds; $i++) {
+        Start-Sleep -Seconds 1
+        if (-not (Test-BgGenerationMine $Gen)) { return $false }
+    }
+    return $true
+}
+
+# Supersede any in-flight worker: the caller bumps the generation first, then
+# this logs every still-pending account as cancelled and clears the queue.
+# The old worker is deliberately NOT killed - it notices the new generation
+# and stops on its own at a safe point.
+function Stop-PreviousBgRun {
+    Initialize-BgDirs
+    $hadPending = $false
+    # A plain foreach (not ForEach-Object) so $hadPending is unambiguously the
+    # one in this scope.
+    $files = @(Get-ChildItem $BG_STATUS_DIR -File -ErrorAction SilentlyContinue)
+    foreach ($f in $files) {
+        $st = Get-BgStatus $f.Name
+        if ($null -ne $st -and $st.Status -eq "PENDING") {
+            $hadPending = $true
+            Write-RefreshLog "BG" $st.Num $st.Email "Cancelled - superseded by a newer switch."
+        }
+        Remove-Item $f.FullName -Force -ErrorAction SilentlyContinue
+    }
+    return $hadPending
+}
+
+# ---- Worker ---------------------------------------------------------------
+# Refresh one account under its lock. Never throws - one account failing must
+# not abort the rest of the queue.
+function Invoke-BgRefreshOne {
+    param([string]$Num, [string]$Email)
+
+    if (-not (Lock-Account $Num $BG_LOCK_WAIT)) {
+        Set-BgStatus $Num $Email "FAILED" "Locked by another csw process"
+        Write-RefreshLog "BG" $Num $Email "Skipped - account lock held by another csw process."
+        return
+    }
+    try {
+        $creds = Read-AccountCredentials $Num $Email
+        if ([string]::IsNullOrEmpty($creds)) {
+            Set-BgStatus $Num $Email "FAILED" "No stored credentials"
+            Write-RefreshLog "BG" $Num $Email "Failed - no stored credentials found."
+            return
+        }
+        $result = Invoke-OAuthRefresh $creds $Num $Email "BG"
+        switch ($result.Status) {
+            0 {
+                try {
+                    Write-AccountCredentials $Num $Email $result.Credentials
+                    Set-RefreshStamp $Num
+                    Set-BgStatus $Num $Email "SUCCESS" ""
+                } catch {
+                    # Refreshed server-side but the new token could not be stored:
+                    # the stored token is now the invalidated one. Say so loudly.
+                    Set-BgStatus $Num $Email "FAILED" "Refreshed but could not save - re-login may be needed"
+                    Write-RefreshLog "BG" $Num $Email "Failed - token refreshed but could not be saved to backup. Re-login with: claude login"
+                }
+            }
+            1 { Set-BgStatus $Num $Email "SKIPPED" "No refreshToken stored" }
+            2 { Set-BgStatus $Num $Email "FAILED"  "Network error" }
+            3 {
+                $d = "HTTP $($result.HttpStatus)"
+                if ($result.RetryAfter) { $d = "$d, retry after $($result.RetryAfter)s" }
+                Set-BgStatus $Num $Email "FAILED" $d
+            }
+            4 { Set-BgStatus $Num $Email "FAILED"  "Invalid server response" }
+        }
+    } catch {
+        Set-BgStatus $Num $Email "FAILED" "Unexpected error: $($_.Exception.Message)"
+        Write-RefreshLog "BG" $Num $Email "Failed - unexpected error: $($_.Exception.Message)"
+    } finally {
+        Unlock-Account $Num
+    }
+}
+
+# Entry point for the detached worker: `ccswitch-windows.ps1 --bg-refresh <gen>`
+function Invoke-BgWorker {
+    param([string]$Gen)
+    if ([string]::IsNullOrEmpty($Gen)) { return }
+
+    # Walk the queue this switch wrote, in numeric order.
+    $queue = @()
+    $files = @(Get-ChildItem $BG_STATUS_DIR -File -ErrorAction SilentlyContinue)
+    foreach ($f in $files) {
+        $st = Get-BgStatus $f.Name
+        if ($null -ne $st -and $st.Status -eq "PENDING") { $queue += $st }
+    }
+    if ($queue.Count -eq 0) { return }
+    $queue = $queue | Sort-Object { [int]$_.Num }
+
+    $first = $true
+    foreach ($item in $queue) {
+        if (-not (Test-BgGenerationMine $Gen)) { return }
+        $delay = if ($first) { $BG_INITIAL_DELAY } else { $BG_GAP_SECONDS }
+        $first = $false
+        if (-not (Start-BgSleepCancellable $delay $Gen)) { return }
+        # Re-check right before touching a token - the cheapest possible moment
+        # to discover we have been superseded.
+        if (-not (Test-BgGenerationMine $Gen)) { return }
+        # Status may have been rewritten while we slept; skip if no longer pending.
+        $now = Get-BgStatus $item.Num
+        if ($null -eq $now -or $now.Status -ne "PENDING") { continue }
+        Invoke-BgRefreshOne $item.Num $item.Email
+    }
+}
+
+# Build the queue for this switch and spawn the detached worker. Accounts
+# refreshed within $REFRESH_FRESH_WINDOW are marked ALREADY and skipped.
+function Start-BgRefresh {
+    param([string]$TargetNum)
+    Initialize-BgDirs
+
+    $gen = "$(Get-NowEpoch)-$PID"
+    # Bump the generation BEFORE queueing so any in-flight worker stops before
+    # it can act on entries this run is about to rewrite.
+    Set-Content -Path $BG_GEN_FILE -Value $gen -Encoding UTF8 -Force
+    if (Stop-PreviousBgRun) {
+        Write-CSWInfo "Cancelled pending background refreshes from the previous switch."
+    }
+
+    $seq = Get-SequenceData
+    if ($null -eq $seq) { return }
+
+    $queued = 0; $skipped = 0
+    foreach ($n in @($seq.sequence)) {
+        $num = "$n"
+        if ($num -eq "$TargetNum") { continue }
+        $p = $seq.accounts.PSObject.Properties | Where-Object { $_.Name -eq $num }
+        if ($null -eq $p) { continue }
+        $email = $p.Value.email
+        if ([string]::IsNullOrEmpty($email)) { continue }
+
+        $age = Get-RefreshAgeSeconds $num
+        if ($null -ne $age -and $age -lt $REFRESH_FRESH_WINDOW) {
+            $human = Format-Duration $age
+            Set-BgStatus $num $email "ALREADY" $human
+            Write-RefreshLog "BG" $num $email "Already refreshed $human - skipped."
+            $skipped++
+            continue
+        }
+        Set-BgStatus $num $email "PENDING" ""
+        $queued++
+    }
+
+    if ($skipped -gt 0) {
+        Write-CSWInfo "Skipped $skipped account(s) refreshed within the last 6 hours."
+    }
+    if ($queued -eq 0) {
+        Remove-Item $BG_PID_FILE -Force -ErrorAction SilentlyContinue
+        Write-CSWInfo "No accounts need a background refresh."
+        return
+    }
+
+    try {
+        $proc = Start-Process -FilePath "powershell.exe" `
+            -ArgumentList @("-NoProfile", "-ExecutionPolicy", "Bypass",
+                            "-File", "`"$PSCommandPath`"", "--bg-refresh", $gen) `
+            -WindowStyle Hidden -PassThru
+        Set-Content -Path $BG_PID_FILE -Value $proc.Id -Encoding UTF8 -Force
+        Write-CSWInfo "Queued $queued account(s) for background refresh ($($BG_GAP_SECONDS)s apart)."
+        Write-CSWDim "Track progress with: csw log"
+    } catch {
+        Remove-Item $BG_PID_FILE -Force -ErrorAction SilentlyContinue
+        Write-CSWWarn "Could not start the background refresh worker: $($_.Exception.Message)"
+    }
 }
 
 # ---------------------------------------------------------------------------
@@ -546,14 +823,24 @@ function Invoke-PerformSwitch {
     # Clear log for this run
     Set-Content -Path $LOG_FILE -Value "" -Encoding UTF8 -Force
 
-    # Foreground OAuth refresh
+    # Foreground OAuth refresh. Take the account lock first so a background
+    # worker from an earlier switch can never refresh this same account at the
+    # same moment (rotating refresh tokens would revoke the token family).
     Write-CSWStep "Refreshing OAuth token for Account-$TargetNum..."
-    $result = Invoke-OAuthRefresh $targetCreds $TargetNum $targetEmail
+    $fgLocked = Lock-Account $TargetNum $BG_LOCK_WAIT
+    if ($fgLocked) {
+        $result = Invoke-OAuthRefresh $targetCreds $TargetNum $targetEmail "FG"
+    } else {
+        Write-CSWWarn "Another csw process is refreshing this account - using stored credentials."
+        Write-RefreshLog "FG" $TargetNum $targetEmail "Skipped - account lock held by another csw process."
+        $result = @{ Status = 5; Credentials = $targetCreds }
+    }
 
     switch ($result.Status) {
         0 {
             $targetCreds = $result.Credentials
             Write-AccountCredentials $TargetNum $targetEmail $targetCreds
+            Set-RefreshStamp $TargetNum
             Write-CSWSuccess "Token refreshed successfully - new access token applied."
         }
         1 { Write-CSWWarn "Token refresh skipped - no refreshToken in stored credentials." }
@@ -565,7 +852,9 @@ function Invoke-PerformSwitch {
             Write-CSWInfo "Re-login with: claude login"
         }
         4 { Write-CSWWarn "Token refresh failed - invalid server response. Using stored credentials." }
+        5 { Write-CSWInfo "Using stored credentials as-is (refresh skipped - account was locked)." }
     }
+    if ($fgLocked) { Unlock-Account $TargetNum }
 
     # Apply credentials
     Write-CSWStep "Applying target credentials/config..."
@@ -597,10 +886,21 @@ function Invoke-PerformSwitch {
     Save-SequenceData $seq
     Write-CSWSuccess "Switched to Account-$TargetNum ($targetEmail)"
 
-    # Disabled: proactively refreshing inactive accounts' tokens now trips
-    # Anthropic's rotating-refresh-token reuse detection and revokes the token
-    # family (HTTP 400 invalid_grant). Claude Code refreshes on launch instead.
-    # Start-BackgroundRefresh $TargetNum
+    # Warm every other account's token in the background, one at a time.
+    #
+    # CAUTION: Anthropic's OAuth server uses ROTATING refresh tokens with reuse
+    # detection - each successful refresh invalidates the previous refresh
+    # token, and presenting an already-used one revokes the entire token family
+    # (HTTP 400 invalid_grant). Start-BgRefresh is built around that: per-
+    # account lock files make a double refresh of one account impossible, and
+    # the generation counter retires a superseded worker cooperatively rather
+    # than terminating it mid-refresh. Do not add a Stop-Process to the
+    # cancellation path - killing a worker between "server rotated the token"
+    # and "token saved to backup" is exactly what strands an account needing
+    # `claude login`.
+    Write-CSWStep "Starting background refresh for other accounts..."
+    Start-BgRefresh $TargetNum
+
     Invoke-List
     Write-Host ""
     Write-CSWWarn "Please restart Claude Code to use the new authentication."
@@ -759,27 +1059,86 @@ function Invoke-RemoveAccount {
 # ---------------------------------------------------------------------------
 # cmd_log
 # ---------------------------------------------------------------------------
+# Render one account's background status line.
+function Write-BgStatusLine {
+    param([string]$Num, [string]$Email, [string]$Status, [string]$Detail)
+    Write-Host "  Account-${Num} (${Email}): " -NoNewline -ForegroundColor White
+    switch ($Status) {
+        "SUCCESS" { Write-Host "Success" -NoNewline -ForegroundColor Green
+                    Write-Host " - token refreshed" -ForegroundColor DarkGray }
+        "PENDING" {
+            Write-Host "Pending" -NoNewline -ForegroundColor Yellow
+            if (Test-BgWorkerAlive) {
+                Write-Host " - queued for background refresh" -ForegroundColor DarkGray
+            } else {
+                Write-Host " - stalled (worker not running; run csw switch again)" -ForegroundColor Red
+            }
+        }
+        "ALREADY" { Write-Host "Already refreshed" -NoNewline -ForegroundColor Cyan
+                    $d = if ($Detail) { $Detail } else { "recently" }
+                    Write-Host " - $d, skipped" -ForegroundColor DarkGray }
+        "SKIPPED" { Write-Host "Skipped" -NoNewline -ForegroundColor Yellow
+                    Write-Host $(if ($Detail) { " - $Detail" } else { "" }) -ForegroundColor DarkGray }
+        "FAILED"  { Write-Host "Failed" -NoNewline -ForegroundColor Red
+                    Write-Host $(if ($Detail) { " - $Detail" } else { "" }) -ForegroundColor DarkGray }
+        default   { Write-Host "$Status $Detail" -ForegroundColor DarkGray }
+    }
+}
+
 function Invoke-Log {
-    if (-not (Test-Path $LOG_FILE) -or [string]::IsNullOrWhiteSpace((Get-Content $LOG_FILE -Raw))) {
+    $haveLog = (Test-Path $LOG_FILE) -and -not [string]::IsNullOrWhiteSpace((Get-Content $LOG_FILE -Raw -ErrorAction SilentlyContinue))
+    $haveStatus = (Test-Path $BG_STATUS_DIR) -and
+                  ((Get-ChildItem $BG_STATUS_DIR -File -ErrorAction SilentlyContinue | Measure-Object).Count -gt 0)
+    if (-not $haveLog -and -not $haveStatus) {
         Write-CSWInfo "No logs found. Logs are created when token refresh runs during switch."; return
     }
     Write-CSWTitle "Token Refresh Status (last switch):"
     Write-Host ""
+    # The account switched to is refreshed in the foreground, so its status
+    # comes from the [FG] log line. Every other account is driven by the
+    # background worker, whose live status lives in $BG_STATUS_DIR.
     if (Test-Path $SEQUENCE_FILE) {
         $seq = Get-SequenceData
         if ($null -ne $seq) {
+            $activeNum = "$($seq.activeAccountNumber)"
             foreach ($n in @($seq.sequence)) {
                 $num = "$n"
                 $p   = $seq.accounts.PSObject.Properties | Where-Object { $_.Name -eq $num }
                 if ($null -eq $p) { continue }
-                $e    = $p.Value.email
-                $last = Get-Content $LOG_FILE | Where-Object { $_ -like "*Account-${num} (${e})*" } | Select-Object -Last 1
-                $msg  = if ($last) { $last } else { "Account-${num} (${e}): Pending (background refresh may still be running)." }
-                Write-Host "  $msg" -ForegroundColor DarkGray
+                $e   = $p.Value.email
+
+                if ($num -eq $activeNum) {
+                    $last = $null
+                    if ($haveLog) {
+                        $last = Get-Content $LOG_FILE |
+                                Where-Object { $_ -like "*[FG] Account-${num} (${e})*" } |
+                                Select-Object -Last 1
+                    }
+                    if ($last) {
+                        $detail = $last -replace '^.*?\): ', ''
+                        Write-Host "  Account-${num} (${e}): " -NoNewline -ForegroundColor White
+                        Write-Host "(active, foreground) " -NoNewline -ForegroundColor DarkGray
+                        Write-Host $detail -ForegroundColor DarkGray
+                    } else {
+                        Write-Host "  Account-${num} (${e}): (active) No refresh recorded for the last switch." -ForegroundColor DarkGray
+                    }
+                    continue
+                }
+
+                $st = Get-BgStatus $num
+                if ($null -eq $st -or [string]::IsNullOrEmpty($st.Status)) {
+                    Write-Host "  Account-${num} (${e}): Not queued for refresh." -ForegroundColor DarkGray
+                } else {
+                    Write-BgStatusLine $num $e $st.Status $st.Detail
+                }
             }
             Write-Host ""
         }
     }
+    if (Test-BgWorkerAlive) {
+        Write-CSWInfo "Background worker is running - re-run 'csw log' to see progress."
+    }
+    if (-not $haveLog) { Write-Host ""; return }
     Write-CSWTitle "Log Entries:"
     Get-Content $LOG_FILE | ForEach-Object { Write-Host $_ }
     Write-Host ""
@@ -883,6 +1242,9 @@ switch ($cmd) {
     { $_ -in @("switch-to","--switch-to","to") }                             { Invoke-SwitchTo $arg1 }
     { $_ -in @("remove-account","rm-account","--remove-account","--rm-account") } { Invoke-RemoveAccount $arg1 }
     { $_ -in @("log","--log") }                                              { Invoke-Log }
+    # Internal: entry point for the detached background refresh worker.
+    # Not listed in Show-Usage; invoked only by Start-BgRefresh.
+    "--bg-refresh"                                                           { Invoke-BgWorker $arg1 }
     { $_ -in @("-check-update","--check-update","check-update") }            { Invoke-CheckUpdate }
     { $_ -in @("-update","--update","update") }                              { Invoke-Update }
     { $_ -in @("-v","-version","--version","version") }                      { Write-CSWSuccess "csw version $CSW_VERSION (Windows)" }

@@ -17,9 +17,16 @@ It only switches **authentication** — your **themes, settings, preferences, an
 - **Multi-account management**: add, remove, list accounts
 - **Fast switching**: rotate to the next account or switch to a specific one
 - **Automatic token refresh**: OAuth tokens are refreshed on every switch
-  - **Foreground**: target account is refreshed before activation
-  - **Background**: all other accounts are refreshed with a 2-minute gap to avoid rate limits
-- **Refresh logs**: view token refresh status with `csw log`
+  - **Foreground**: the account you switch to is refreshed before activation —
+    refreshed, saved, and applied in sync
+  - **Background**: every other account is refreshed by a detached worker, one
+    at a time with a 1-minute gap, so requests are never bursted
+  - **Already refreshed**: an account csw refreshed within the last 6 hours is
+    left alone instead of being queued again
+  - Starting a new switch cancels any refreshes still pending from the previous
+    one and queues a fresh run
+- **Refresh logs**: `csw log` shows live per-account status — `Pending`,
+  `Success`, `Already refreshed`, `Skipped`, or `Failed` with the reason
 - **Cross-platform**: macOS, Linux, WSL, Windows
 - **Secure storage**
   - **macOS**: credentials stored in **Keychain**
@@ -91,7 +98,8 @@ csw switch-to user2@example.com
 csw remove-account 2
 csw remove-account user2@example.com
 
-# View token refresh logs from the last switch
+# View refresh status + logs from the last switch
+# (re-run while a background refresh is in flight to watch Pending -> Success)
 csw log
 
 # Help
@@ -165,8 +173,19 @@ csw switch                # both accounts now refresh cleanly
 
 > Anthropic uses **rotating refresh tokens with reuse detection**. Each refresh
 > invalidates the previous token, and presenting an already-used token revokes
-> the whole token family. `csw` no longer refreshes inactive accounts in the
-> background for this reason — Claude Code refreshes its own token on launch.
+> the whole token family.
+>
+> Background refresh is built around that constraint. An account is refreshed by
+> at most one process at a time (per-account lock files), a superseded worker
+> retires itself at a safe checkpoint rather than being killed mid-refresh, and
+> accounts refreshed in the last 6 hours are skipped entirely. If you see
+> `Failed — Refreshed but could not save` in `csw log`, that account's stored
+> token is the invalidated one and it needs `claude login`.
+
+### Background refreshes are stuck on `Pending`
+
+`csw log` marks an account `Pending — stalled` when the worker process is gone
+(a reboot, a killed terminal). Run `csw switch` again to queue a fresh run.
 
 ---
 

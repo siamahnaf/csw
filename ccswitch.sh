@@ -3,7 +3,7 @@
 
 set -euo pipefail
 
-readonly CSW_VERSION="2.6.2"
+readonly CSW_VERSION="2.7.0"
 
 # Repo info (used for update checks)
 readonly CSW_REPO="siamahnaf/csw"
@@ -13,6 +13,24 @@ readonly CSW_DEFAULT_BRANCH="main"
 readonly BACKUP_DIR="$HOME/.claude-switch-backup"
 readonly SEQUENCE_FILE="$BACKUP_DIR/sequence.json"
 readonly LOG_FILE="$BACKUP_DIR/csw.log"
+
+# Background refresh state
+readonly BG_DIR="$BACKUP_DIR/bg"
+readonly BG_PID_FILE="$BG_DIR/worker.pid"
+readonly BG_GEN_FILE="$BG_DIR/generation"
+readonly BG_STATUS_DIR="$BG_DIR/status"
+readonly BG_TS_DIR="$BG_DIR/last-refresh"
+readonly BG_LOCK_DIR="$BG_DIR/locks"
+
+# Gap between consecutive background refreshes (rate-limit friendly)
+readonly BG_GAP_SECONDS=60
+# Delay before the first background refresh, so it never overlaps the
+# foreground refresh of the account being switched to
+readonly BG_INITIAL_DELAY=5
+# An account refreshed by csw within this window is left alone
+readonly REFRESH_FRESH_WINDOW=21600   # 6 hours
+# How long to wait for another process to release an account lock
+readonly BG_LOCK_WAIT=15
 
 # -----------------------------
 # Colors / Styled output
@@ -34,6 +52,13 @@ error()   { printf "%s%s[ERR]%s  %s\n" "$RED"    "$BOLD" "$RESET" "$*"; }
 step()    { printf "%s%s==>%s %s\n"     "$CYAN"   "$BOLD" "$RESET" "$*"; }
 title()   { printf "%s%s%s%s\n"         "$MAGENTA" "$BOLD" "$*" "$RESET"; }
 dimln()   { printf "%s%s%s\n"           "$DIM" "$*" "$RESET"; }
+
+# Append one refresh outcome to the log. Every refresh attempt logs exactly one
+# line — success or failure — so `csw log` is never empty after a switch.
+#   log_refresh <FG|BG> <account_num> <email> <message>
+log_refresh() {
+  echo "[$(date '+%Y-%m-%d %H:%M:%S')] [$1] Account-$2 ($3): $4" >> "$LOG_FILE"
+}
 
 # -----------------------------
 # Claude CLI version (cached, resolved on first use)
@@ -251,6 +276,303 @@ refresh_oauth_token() {
 }
 
 # -----------------------------
+# Background refresh: state helpers
+#
+# Inactive accounts are refreshed by a detached worker, one at a time with a
+# gap between each, so we never burst requests at the OAuth server.
+#
+# Two invariants keep this safe against Anthropic's rotating refresh tokens
+# (where refreshing with an already-used token revokes the whole token family):
+#
+#   1. Per-account mkdir lock — no two processes ever refresh the same account
+#      concurrently, so the same refresh token is never presented twice.
+#   2. Generation counter — a superseded worker stops cooperatively at its next
+#      checkpoint instead of being killed, so it can never be signalled away
+#      mid-refresh with a rotated-but-unsaved token.
+# -----------------------------
+bg_setup_dirs() {
+  mkdir -p "$BG_DIR" "$BG_STATUS_DIR" "$BG_TS_DIR" "$BG_LOCK_DIR"
+  chmod 700 "$BG_DIR" "$BG_STATUS_DIR" "$BG_TS_DIR" "$BG_LOCK_DIR" 2>/dev/null || true
+}
+
+now_epoch() { date +%s; }
+
+# Absolute path to this script, so the worker can re-exec it detached.
+script_path() {
+  local p="${BASH_SOURCE[0]}"
+  case "$p" in
+    /*) printf '%s' "$p" ;;
+    *)  printf '%s/%s' "$PWD" "$p" ;;
+  esac
+}
+
+# Stamp the time of a successful refresh (drives the "Already refreshed" rule).
+record_refresh_time() {
+  bg_setup_dirs
+  printf '%s\n' "$(now_epoch)" > "$BG_TS_DIR/$1"
+}
+
+# Seconds since csw last refreshed this account; returns 1 if never.
+refresh_age_seconds() {
+  local f="$BG_TS_DIR/$1" ts
+  [[ -f "$f" ]] || return 1
+  ts="$(head -n 1 "$f" 2>/dev/null || true)"
+  [[ "$ts" =~ ^[0-9]+$ ]] || return 1
+  echo $(( $(now_epoch) - ts ))
+}
+
+human_duration() {
+  local s="$1"
+  if (( s < 60 )); then       echo "${s}s ago"
+  elif (( s < 3600 )); then   echo "$(( s / 60 ))m ago"
+  else                        echo "$(( s / 3600 ))h $(( (s % 3600) / 60 ))m ago"
+  fi
+}
+
+# Per-account status, one file per account so concurrent writers never clash.
+#   bg_set_status <num> <email> <PENDING|SUCCESS|FAILED|ALREADY|CANCELLED> [detail]
+bg_set_status() {
+  bg_setup_dirs
+  local detail; detail="$(printf '%s' "${4:-}" | tr '\t\n' '  ')"
+  printf '%s\t%s\t%s\t%s\n' "$1" "$2" "$3" "$detail" > "$BG_STATUS_DIR/$1"
+}
+
+bg_get_status_field() {
+  local num="$1" field="$2" f="$BG_STATUS_DIR/$1"
+  [[ -f "$f" ]] || return 1
+  awk -F'\t' -v n="$field" 'NR==1{print $n}' "$f" 2>/dev/null
+}
+
+# -----------------------------
+# Background refresh: per-account locks (mkdir is atomic everywhere)
+# -----------------------------
+acct_lock_acquire() {
+  # NOTE: bash 3.2 creates all names in a `local` list before assigning, so a
+  # later item cannot reference an earlier one. Keep these separate.
+  local num="$1" timeout="${2:-0}" waited=0 owner=""
+  local lock="$BG_LOCK_DIR/$num.lock"
+  bg_setup_dirs
+  while ! mkdir "$lock" 2>/dev/null; do
+    # Reclaim a lock whose owner died (crash, reboot, kill -9)
+    owner="$(head -n 1 "$lock/pid" 2>/dev/null || true)"
+    if [[ ! "$owner" =~ ^[0-9]+$ ]] || ! kill -0 "$owner" 2>/dev/null; then
+      rm -rf "$lock"
+      continue
+    fi
+    (( waited >= timeout )) && return 1
+    sleep 1
+    waited=$(( waited + 1 ))
+  done
+  printf '%s\n' "$$" > "$lock/pid"
+  return 0
+}
+
+acct_lock_release() {
+  rm -rf "$BG_LOCK_DIR/$1.lock"
+}
+
+# -----------------------------
+# Background refresh: generation / cancellation
+# -----------------------------
+bg_current_generation() {
+  [[ -f "$BG_GEN_FILE" ]] && head -n 1 "$BG_GEN_FILE" 2>/dev/null || true
+}
+
+# True while this worker is still the current one.
+bg_generation_is_mine() {
+  [[ "$(bg_current_generation)" == "$1" ]]
+}
+
+bg_worker_alive() {
+  local pid=""
+  [[ -f "$BG_PID_FILE" ]] && pid="$(head -n 1 "$BG_PID_FILE" 2>/dev/null || true)"
+  [[ "$pid" =~ ^[0-9]+$ ]] && kill -0 "$pid" 2>/dev/null
+}
+
+# Interruptible sleep: polls the generation file so a superseded worker stops
+# within a second instead of sitting out a full gap.
+bg_sleep_cancellable() {
+  local total="$1" gen="$2" elapsed=0
+  while (( elapsed < total )); do
+    sleep 1
+    elapsed=$(( elapsed + 1 ))
+    bg_generation_is_mine "$gen" || return 1
+  done
+  return 0
+}
+
+# Supersede any in-flight worker: bump the generation, then log every account
+# still pending as cancelled. The old worker is deliberately NOT killed — it
+# notices the new generation and stops on its own at a safe point.
+bg_cancel_previous() {
+  bg_setup_dirs
+  local had_pending=0 num email status
+  if [[ -d "$BG_STATUS_DIR" ]]; then
+    for f in "$BG_STATUS_DIR"/*; do
+      [[ -f "$f" ]] || continue
+      IFS=$'\t' read -r num email status _ < "$f" || continue
+      if [[ "$status" == "PENDING" ]]; then
+        had_pending=1
+        log_refresh BG "$num" "$email" "Cancelled — superseded by a newer switch."
+      fi
+      rm -f "$f"
+    done
+  fi
+  return $(( 1 - had_pending ))
+}
+
+# -----------------------------
+# Background refresh: worker
+# -----------------------------
+# Refresh one account under its lock. Never exits non-zero — a single account
+# failing must not abort the rest of the queue.
+bg_refresh_one() {
+  local num="$1" email="$2"
+
+  if ! acct_lock_acquire "$num" "$BG_LOCK_WAIT"; then
+    bg_set_status "$num" "$email" "FAILED" "Locked by another csw process"
+    log_refresh BG "$num" "$email" "Skipped — account lock held by another csw process."
+    return 0
+  fi
+
+  local creds rc=0 msg_file new_creds
+  creds="$(read_account_credentials "$num" "$email")"
+  if [[ -z "$creds" ]]; then
+    acct_lock_release "$num"
+    bg_set_status "$num" "$email" "FAILED" "No stored credentials"
+    log_refresh BG "$num" "$email" "Failed — no stored credentials found."
+    return 0
+  fi
+
+  msg_file="$(mktemp)"
+  new_creds="$(refresh_oauth_token "$creds" "$msg_file")" || rc=$?
+  case $rc in
+    0)
+      if write_account_credentials "$num" "$email" "$new_creds"; then
+        record_refresh_time "$num"
+        bg_set_status "$num" "$email" "SUCCESS" ""
+        log_refresh BG "$num" "$email" "Token refreshed successfully."
+      else
+        # Refresh succeeded server-side but the new token could not be stored:
+        # the stored token is now the invalidated one. Say so loudly.
+        bg_set_status "$num" "$email" "FAILED" "Refreshed but could not save — re-login may be needed"
+        log_refresh BG "$num" "$email" "Failed — token refreshed but could not be saved to backup. Re-login with: claude login"
+      fi
+      ;;
+    1)
+      bg_set_status "$num" "$email" "SKIPPED" "No refreshToken stored"
+      log_refresh BG "$num" "$email" "Skipped — no refreshToken in stored credentials."
+      ;;
+    2)
+      bg_set_status "$num" "$email" "FAILED" "Network error"
+      log_refresh BG "$num" "$email" "Failed — network error (curl failed or timed out)."
+      ;;
+    3)
+      local http_status retry_after detail
+      http_status="$(grep '^HTTP_STATUS=' "$msg_file" 2>/dev/null | sed 's/HTTP_STATUS=//' || true)"
+      retry_after="$(grep '^RETRY_AFTER=' "$msg_file" 2>/dev/null | sed 's/RETRY_AFTER=//' || true)"
+      detail="HTTP ${http_status:-unknown}"
+      [[ -n "$retry_after" ]] && detail="$detail, retry after ${retry_after}s"
+      bg_set_status "$num" "$email" "FAILED" "$detail"
+      log_refresh BG "$num" "$email" "Failed — $detail from Claude server."
+      ;;
+    4)
+      bg_set_status "$num" "$email" "FAILED" "Invalid server response"
+      log_refresh BG "$num" "$email" "Failed — invalid or empty response (missing access_token or malformed JSON)."
+      ;;
+  esac
+  rm -f "$msg_file"
+  acct_lock_release "$num"
+  return 0
+}
+
+# Entry point for the detached worker process: `csw --bg-refresh <generation>`.
+bg_worker_main() {
+  local gen="${1:-}"
+  [[ -z "$gen" ]] && return 0
+
+  # Walk the queue this switch wrote. Sorted numerically for stable ordering.
+  local queue num email status first=1
+  queue="$(
+    for f in "$BG_STATUS_DIR"/*; do
+      [[ -f "$f" ]] || continue
+      IFS=$'\t' read -r num email status _ < "$f" || continue
+      [[ "$status" == "PENDING" ]] && printf '%s\t%s\n' "$num" "$email"
+    done | sort -n -k1,1
+  )"
+  [[ -z "$queue" ]] && return 0
+
+  while IFS=$'\t' read -r num email; do
+    [[ -z "$num" ]] && continue
+    bg_generation_is_mine "$gen" || return 0
+    if (( first )); then
+      bg_sleep_cancellable "$BG_INITIAL_DELAY" "$gen" || return 0
+      first=0
+    else
+      bg_sleep_cancellable "$BG_GAP_SECONDS" "$gen" || return 0
+    fi
+    # Re-check right before touching a token — the cheapest possible moment
+    # to discover we have been superseded.
+    bg_generation_is_mine "$gen" || return 0
+    # Status may have been rewritten while we slept; skip if no longer pending.
+    status="$(bg_get_status_field "$num" 3 || true)"
+    [[ "$status" == "PENDING" ]] || continue
+    bg_refresh_one "$num" "$email"
+  done <<< "$queue"
+
+  return 0
+}
+
+# Build the queue for this switch and spawn the detached worker.
+# Accounts refreshed within REFRESH_FRESH_WINDOW are marked ALREADY and skipped.
+bg_start_refresh() {
+  local target_num="$1"
+  bg_setup_dirs
+
+  local gen queued=0 skipped=0 num email age
+  gen="$(now_epoch)-$$"
+
+  # Bump the generation BEFORE queueing so any in-flight worker stops before
+  # it can act on entries this run is about to rewrite.
+  printf '%s\n' "$gen" > "$BG_GEN_FILE"
+  bg_cancel_previous && info "Cancelled pending background refreshes from the previous switch."
+
+  while IFS= read -r num; do
+    [[ -z "$num" || "$num" == "$target_num" ]] && continue
+    email="$(jq -r --arg n "$num" '.accounts[$n].email // empty' "$SEQUENCE_FILE" 2>/dev/null || true)"
+    [[ -z "$email" ]] && continue
+
+    age="$(refresh_age_seconds "$num" || true)"
+    if [[ -n "$age" ]] && (( age < REFRESH_FRESH_WINDOW )); then
+      bg_set_status "$num" "$email" "ALREADY" "$(human_duration "$age")"
+      log_refresh BG "$num" "$email" "Already refreshed $(human_duration "$age") — skipped."
+      skipped=$(( skipped + 1 ))
+      continue
+    fi
+
+    bg_set_status "$num" "$email" "PENDING" ""
+    queued=$(( queued + 1 ))
+  done < <(jq -r '.sequence[]? | tostring' "$SEQUENCE_FILE" 2>/dev/null || true)
+
+  (( skipped > 0 )) && info "Skipped $skipped account(s) refreshed within the last 6 hours."
+
+  if (( queued == 0 )); then
+    rm -f "$BG_PID_FILE"
+    info "No accounts need a background refresh."
+    return 0
+  fi
+
+  local self; self="$(script_path)"
+  nohup /bin/bash "$self" --bg-refresh "$gen" >/dev/null 2>&1 &
+  local worker_pid=$!
+  disown "$worker_pid" 2>/dev/null || true
+  printf '%s\n' "$worker_pid" > "$BG_PID_FILE"
+
+  info "Queued $queued account(s) for background refresh (${BG_GAP_SECONDS}s apart)."
+  dimln "  Track progress with: csw log"
+}
+
+# -----------------------------
 # Dependencies
 # -----------------------------
 check_dependencies() {
@@ -381,6 +703,7 @@ cmd_update() {
 setup_directories() {
   mkdir -p "$BACKUP_DIR/configs" "$BACKUP_DIR/credentials"
   chmod 700 "$BACKUP_DIR" "$BACKUP_DIR/configs" "$BACKUP_DIR/credentials"
+  bg_setup_dirs
 }
 
 # -----------------------------
@@ -825,31 +1148,55 @@ perform_switch() {
   printf '' > "$LOG_FILE"
 
   step "Refreshing OAuth token for Account-$target_account..."
+  # Take the account lock so a background worker from an earlier switch can
+  # never refresh this same account at the same moment (rotating refresh
+  # tokens would revoke the token family).
+  local fg_locked=0
+  if acct_lock_acquire "$target_account" "$BG_LOCK_WAIT"; then
+    fg_locked=1
+  else
+    warn "Another csw process is refreshing this account — using stored credentials."
+    log_refresh FG "$target_account" "$target_email" "Skipped — account lock held by another csw process."
+  fi
+
   local fg_msg_file; fg_msg_file="$(mktemp)"
   local refreshed_creds refresh_rc=0
-  refreshed_creds="$(refresh_oauth_token "$target_creds" "$fg_msg_file")" || refresh_rc=$?
+  if (( fg_locked )); then
+    refreshed_creds="$(refresh_oauth_token "$target_creds" "$fg_msg_file")" || refresh_rc=$?
+  else
+    refresh_rc=5
+  fi
   case $refresh_rc in
     0)
       target_creds="$refreshed_creds"
       write_account_credentials "$target_account" "$target_email" "$refreshed_creds"
-      echo "[$(date '+%Y-%m-%d %H:%M:%S')] [FG] Account-$target_account ($target_email): Token refreshed successfully." >> "$LOG_FILE"
+      record_refresh_time "$target_account"
+      log_refresh FG "$target_account" "$target_email" "Token refreshed successfully."
       success "Token refreshed successfully — new access token applied and saved to backup."
       ;;
     1)
+      log_refresh FG "$target_account" "$target_email" "Skipped — no refreshToken in stored credentials."
       warn "Token refresh skipped — no refreshToken found in stored credentials."
       info "The account will use its existing access token (valid until it expires)."
       ;;
     2)
+      log_refresh FG "$target_account" "$target_email" "Failed — network error (curl failed or timed out)."
       warn "Token refresh failed — network error (no internet or server unreachable)."
       info "Using stored credentials as-is. If the access token has expired, re-login with: claude login"
       ;;
     3)
       local raw_response http_status retry_after requests_reset requests_remaining
       raw_response="$(sed -e '/^HTTP_STATUS=/d' -e '/^RETRY_AFTER=/d' -e '/^REQUESTS_RESET=/d' -e '/^REQUESTS_REMAINING=/d' "$fg_msg_file" 2>/dev/null)"
-      http_status="$(grep '^HTTP_STATUS=' "$fg_msg_file" 2>/dev/null | sed 's/HTTP_STATUS=//')"
-      retry_after="$(grep '^RETRY_AFTER=' "$fg_msg_file" 2>/dev/null | sed 's/RETRY_AFTER=//')"
-      requests_reset="$(grep '^REQUESTS_RESET=' "$fg_msg_file" 2>/dev/null | sed 's/REQUESTS_RESET=//')"
-      requests_remaining="$(grep '^REQUESTS_REMAINING=' "$fg_msg_file" 2>/dev/null | sed 's/REQUESTS_REMAINING=//')"
+      # `|| true` is required: these keys are optional, and pipefail would make
+      # a non-matching grep abort the script mid-diagnostic.
+      http_status="$(grep '^HTTP_STATUS=' "$fg_msg_file" 2>/dev/null | sed 's/HTTP_STATUS=//' || true)"
+      retry_after="$(grep '^RETRY_AFTER=' "$fg_msg_file" 2>/dev/null | sed 's/RETRY_AFTER=//' || true)"
+      requests_reset="$(grep '^REQUESTS_RESET=' "$fg_msg_file" 2>/dev/null | sed 's/REQUESTS_RESET=//' || true)"
+      requests_remaining="$(grep '^REQUESTS_REMAINING=' "$fg_msg_file" 2>/dev/null | sed 's/REQUESTS_REMAINING=//' || true)"
+      local log_detail="Failed — HTTP ${http_status:-unknown} from Claude server."
+      [[ -n "$retry_after" ]] && log_detail="$log_detail Retry after ${retry_after}s."
+      [[ -n "$requests_reset" ]] && log_detail="$log_detail Rate limit resets at ${requests_reset}."
+      log_refresh FG "$target_account" "$target_email" "$log_detail"
       warn "Token refresh failed — HTTP $http_status from Claude server."
       if [[ -n "$raw_response" ]]; then
         info "Claude server response:"
@@ -867,11 +1214,16 @@ perform_switch() {
       info "Re-login with: claude login"
       ;;
     4)
+      log_refresh FG "$target_account" "$target_email" "Failed — invalid or empty response (missing access_token or malformed JSON)."
       warn "Token refresh failed — server returned an invalid or empty response."
       info "Using stored credentials as-is. If login fails, re-authenticate with: claude login"
       ;;
+    5)
+      info "Using stored credentials as-is (refresh skipped — account was locked)."
+      ;;
   esac
   rm -f "$fg_msg_file"
+  (( fg_locked )) && acct_lock_release "$target_account"
 
   step "Applying target credentials/config..."
   write_credentials "$target_creds"
@@ -905,20 +1257,21 @@ perform_switch() {
 
   success "Switched to Account-$target_account ($target_email)"
 
-  # NOTE: We deliberately do NOT proactively refresh inactive accounts'
-  # tokens in the background anymore.
+  # Warm every other account's token in the background, one at a time.
   #
-  # Anthropic's OAuth server now uses ROTATING refresh tokens with reuse
-  # detection: each successful refresh invalidates the previous refresh token,
-  # and presenting an already-used token revokes the entire token family
+  # CAUTION: Anthropic's OAuth server uses ROTATING refresh tokens with reuse
+  # detection — each successful refresh invalidates the previous refresh token,
+  # and presenting an already-used one revokes the entire token family
   # (HTTP 400 invalid_grant — "Refresh token not found or invalid").
   #
-  # A background job that re-refreshes stored tokens — especially when several
-  # overlapping jobs from rapid switches race on the same account — reliably
-  # trips reuse detection and kills the account's credentials. Claude Code
-  # refreshes its own token on launch, so warming inactive tokens buys nothing
-  # and only creates desync. The foreground refresh of the target account above
-  # is safe because it refreshes, saves, and applies the same new token in sync.
+  # bg_start_refresh is built around that: per-account mkdir locks make a
+  # double refresh of one account impossible, and the generation counter
+  # retires a superseded worker cooperatively rather than signalling it away
+  # mid-refresh. Do not add a `kill` to the cancellation path — killing a
+  # worker between "server rotated the token" and "token saved to backup" is
+  # exactly what strands an account needing `claude login`.
+  step "Starting background refresh for other accounts..."
+  bg_start_refresh "$target_account"
 
   cmd_list
   echo ""
@@ -926,8 +1279,33 @@ perform_switch() {
   echo ""
 }
 
+# Colored status label for one account in the per-account summary.
+_log_status_line() {
+  local num="$1" email="$2" status="$3" detail="$4"
+  local label
+  case "$status" in
+    SUCCESS)   label="${GREEN}Success${RESET} — token refreshed" ;;
+    PENDING)
+      if bg_worker_alive; then
+        label="${YELLOW}Pending${RESET} — queued for background refresh"
+      else
+        label="${YELLOW}Pending${RESET} — ${RED}stalled${RESET} (worker not running; run csw switch again)"
+      fi
+      ;;
+    ALREADY)   label="${CYAN}Already refreshed${RESET} — ${detail:-recently}, skipped" ;;
+    SKIPPED)   label="${YELLOW}Skipped${RESET}${detail:+ — $detail}" ;;
+    FAILED)    label="${RED}Failed${RESET}${detail:+ — $detail}" ;;
+    CANCELLED) label="${DIM}Cancelled${RESET} — superseded by a newer switch" ;;
+    *)         label="$status${detail:+ — $detail}" ;;
+  esac
+  printf "  %sAccount-%s (%s)%s: %s\n" "$BOLD" "$num" "$email" "$RESET" "$label"
+}
+
 cmd_log() {
-  if [[ ! -f "$LOG_FILE" || ! -s "$LOG_FILE" ]]; then
+  local have_log=0 have_status=0
+  [[ -f "$LOG_FILE" && -s "$LOG_FILE" ]] && have_log=1
+  [[ -d "$BG_STATUS_DIR" ]] && [[ -n "$(ls -A "$BG_STATUS_DIR" 2>/dev/null || true)" ]] && have_status=1
+  if (( have_log == 0 && have_status == 0 )); then
     info "No logs found. Logs are created when token refresh runs during switch."
     return 0
   fi
@@ -935,25 +1313,50 @@ cmd_log() {
   title "Token Refresh Status (last switch):"
   echo ""
 
-  # Show per-account status
+  # The account switched to is refreshed in the foreground, so its status comes
+  # from the [FG] log line. Every other account is driven by the background
+  # worker, whose live status lives in $BG_STATUS_DIR.
   if [[ -f "$SEQUENCE_FILE" ]]; then
-    local acct_num acct_email last_entry
+    local active_num acct_num acct_email fg_entry status detail
+    active_num="$(jq -r '.activeAccountNumber // empty | tostring' "$SEQUENCE_FILE" 2>/dev/null || true)"
     while IFS= read -r acct_num; do
-      acct_email="$(jq -r --arg num "$acct_num" '.accounts[$num].email // empty' "$SEQUENCE_FILE" 2>/dev/null)"
+      acct_email="$(jq -r --arg num "$acct_num" '.accounts[$num].email // empty' "$SEQUENCE_FILE" 2>/dev/null || true)"
       [[ -z "$acct_email" ]] && continue
-      last_entry="$(grep "Account-$acct_num ($acct_email)" "$LOG_FILE" 2>/dev/null | tail -1)"
-      if [[ -n "$last_entry" ]]; then
-        dimln "  $last_entry"
-      else
-        dimln "  Account-$acct_num ($acct_email): Pending (background refresh may still be running)."
+
+      if [[ "$acct_num" == "$active_num" ]]; then
+        # `|| true`: pipefail would abort on an account with no log entry
+        fg_entry="$(grep "\[FG\] Account-$acct_num ($acct_email)" "$LOG_FILE" 2>/dev/null | tail -1 || true)"
+        if [[ -n "$fg_entry" ]]; then
+          printf "  %sAccount-%s (%s)%s: %s(active, foreground)%s %s\n" \
+            "$BOLD" "$acct_num" "$acct_email" "$RESET" "$DIM" "$RESET" \
+            "${fg_entry#*): }"
+        else
+          dimln "  Account-$acct_num ($acct_email): (active) No refresh recorded for the last switch."
+        fi
+        continue
       fi
-    done < <(jq -r '.sequence[]? | tostring' "$SEQUENCE_FILE" 2>/dev/null)
+
+      status="$(bg_get_status_field "$acct_num" 3 2>/dev/null || true)"
+      detail="$(bg_get_status_field "$acct_num" 4 2>/dev/null || true)"
+      if [[ -z "$status" ]]; then
+        dimln "  Account-$acct_num ($acct_email): Not queued for refresh."
+      else
+        _log_status_line "$acct_num" "$acct_email" "$status" "$detail"
+      fi
+    done < <(jq -r '.sequence[]? | tostring' "$SEQUENCE_FILE" 2>/dev/null || true)
     echo ""
   fi
 
-  title "Log Entries:"
-  cat "$LOG_FILE"
+  if bg_worker_alive; then
+    info "Background worker is running — re-run 'csw log' to see progress."
+  fi
   echo ""
+
+  if (( have_log )); then
+    title "Log Entries:"
+    cat "$LOG_FILE"
+    echo ""
+  fi
 }
 
 show_usage() {
@@ -966,7 +1369,7 @@ show_usage() {
   dimln "  --list                           List all managed accounts"
   dimln "  --switch                         Rotate to next account in sequence"
   dimln "  --switch-to <num|email>          Switch to specific account number or email"
-  dimln "  --log                            Show token refresh logs from last switch"
+  dimln "  --log                            Show token refresh status/logs from last switch"
   dimln "  --check-update                   Check for updates"
   dimln "  --update                         Update csw to the latest version"
   dimln "  -v, --version                    Show csw version"
@@ -991,6 +1394,9 @@ main() {
   --switch|switch|next) cmd_switch ;;
   --switch-to|switch-to|to) shift; cmd_switch_to "$@" ;;
   --log|log) shift; cmd_log "$@" ;;
+  # Internal: entry point for the detached background refresh worker.
+  # Not listed in --help; invoked only by bg_start_refresh.
+  --bg-refresh) shift; bg_worker_main "$@" ;;
   --help|help|-h|"") show_usage ;;
   *) error "Unknown command '$1'"; show_usage; exit 1 ;;
   esac
