@@ -3,7 +3,7 @@
 
 $ErrorActionPreference = "Stop"
 
-$CSW_VERSION        = "2.8.0"
+$CSW_VERSION        = "2.8.1"
 $CSW_REPO           = "siamahnaf/csw"
 $CSW_DEFAULT_BRANCH = "main"
 

@@ -3,7 +3,7 @@
 
 set -euo pipefail
 
-readonly CSW_VERSION="2.8.0"
+readonly CSW_VERSION="2.8.1"
 
 # Repo info (used for update checks)
 readonly CSW_REPO="siamahnaf/csw"
@@ -45,11 +45,13 @@ BOLD="$(printf '\033[1m')"
 DIM="$(printf '\033[2m')"
 RESET="$(printf '\033[0m')"
 
-info()    { printf "%s%s[INFO]%s %s\n" "$BLUE"   "$BOLD" "$RESET" "$*"; }
-warn()    { printf "%s%s[WARN]%s %s\n" "$YELLOW" "$BOLD" "$RESET" "$*"; }
-success() { printf "%s%s[OK]%s   %s\n" "$GREEN"  "$BOLD" "$RESET" "$*"; }
-error()   { printf "%s%s[ERR]%s  %s\n" "$RED"    "$BOLD" "$RESET" "$*"; }
-step()    { printf "%s%s==>%s %s\n"     "$CYAN"   "$BOLD" "$RESET" "$*"; }
+# Status messages go to stderr so they can never be captured by a `$(...)` that
+# is reading a function's real return value (e.g. get_current_account).
+info()    { printf "%s%s[INFO]%s %s\n" "$BLUE"   "$BOLD" "$RESET" "$*" >&2; }
+warn()    { printf "%s%s[WARN]%s %s\n" "$YELLOW" "$BOLD" "$RESET" "$*" >&2; }
+success() { printf "%s%s[OK]%s   %s\n" "$GREEN"  "$BOLD" "$RESET" "$*" >&2; }
+error()   { printf "%s%s[ERR]%s  %s\n" "$RED"    "$BOLD" "$RESET" "$*" >&2; }
+step()    { printf "%s%s==>%s %s\n"     "$CYAN"   "$BOLD" "$RESET" "$*" >&2; }
 title()   { printf "%s%s%s%s\n"         "$MAGENTA" "$BOLD" "$*" "$RESET"; }
 dimln()   { printf "%s%s%s\n"           "$DIM" "$*" "$RESET"; }
 
@@ -114,9 +116,32 @@ get_claude_config_path() {
 # -----------------------------
 # JSON helpers
 # -----------------------------
+# Owner of a path, portable across macOS (BSD stat) and Linux (GNU stat).
+file_owner() {
+  stat -f '%Su' "$1" 2>/dev/null || stat -c '%U' "$1" 2>/dev/null || echo "unknown"
+}
+
+# A config owned by root (usually the result of running `claude` or its
+# installer under sudo) is unreadable, not malformed. Say so, with the fix.
+report_unreadable() {
+  local file="$1"
+  error "Cannot read $file (permission denied)."
+  error "It is owned by '$(file_owner "$file")' — most likely a tool was run with sudo."
+  error "Fix it with: sudo chown \"\$(id -un):\$(id -gn)\" \"$file\" && chmod 600 \"$file\""
+}
+
 validate_json() {
   local file="$1"
+  [[ -r "$file" ]] || { report_unreadable "$file"; return 1; }
   jq . "$file" >/dev/null 2>&1 || { error "Invalid JSON in $file"; return 1; }
+}
+
+# cat "$file", but fail loudly instead of emitting an empty string when the
+# file exists yet cannot be read.
+read_file_or_fail() {
+  local file="$1"
+  [[ -r "$file" ]] || { report_unreadable "$file"; return 1; }
+  cat "$file"
 }
 
 validate_email() {
@@ -975,7 +1000,7 @@ cmd_add_account() {
 
   local current_creds current_config
   current_creds="$(read_credentials)"
-  current_config="$(cat "$cfg_path")"
+  current_config="$(read_file_or_fail "$cfg_path")" || exit 1
 
   [[ -z "$current_creds" ]] && { error "No credentials found/readable for current account (Keychain service mismatch or permissions)."; exit 1; }
 
@@ -1166,7 +1191,7 @@ perform_switch() {
   local cfg_path; cfg_path="$(get_claude_config_path)"
   local current_creds current_config
   current_creds="$(read_credentials)"
-  current_config="$(cat "$cfg_path")"
+  current_config="$(read_file_or_fail "$cfg_path")" || exit 1
   # Sanitize both before storing backup to prevent auth conflict on restore
   current_creds="$(sanitize_credentials_json "$current_creds")"
   current_config="$(sanitize_config_json "$current_config")"
