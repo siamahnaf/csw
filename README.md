@@ -86,8 +86,15 @@ hash -r
 # Add the currently logged-in Claude Code account to managed accounts
 csw add-account
 
-# List all managed accounts
+# List all managed accounts with their session expiry
 csw list
+
+# Sign in again to an account whose session ended, and save the new session
+csw relogin 2
+csw relogin user2@example.com
+
+# After a manual `claude login`, update the saved copy of the logged-in account
+csw add-account
 
 # Switch to the next account in your rotation
 csw switch
@@ -153,6 +160,23 @@ After switching, **restart Claude Code** to apply the new authentication.
 
 ## Troubleshooting
 
+### `Refresh token expired` / "session ended" — the 30-day limit
+
+Claude limits each login to about **30 days**. Refreshing a token, whether by
+Claude Code or by `csw`, gives you new tokens but **does not extend that date**.
+Once it passes, the only fix is to sign in again.
+
+- `csw list` shows when each account expires, and warns 3 days ahead.
+- `csw switch` notices an expired target and offers to re-login on the spot.
+- `csw relogin <num|email>` opens the browser login pre-filled with that
+  account's email, checks you signed in as the right account, and saves the
+  new session.
+
+If your browser is signed in to a different claude.ai account, the login may
+approve the wrong one. `csw` detects this and won't save it under the wrong
+account. Sign out of claude.ai in the browser, or use a private window, then
+run `csw relogin` again.
+
 ### `HTTP 400 invalid_grant — "Refresh token not found or invalid"` when switching
 
 This means the stored refresh token for that account has been **revoked on
@@ -165,15 +189,10 @@ can no longer be refreshed.
 credentials without revoking the previous account's token, but logging out
 kills it permanently.
 
-**To recover a broken account** (example for Account-1, while Account-2 stays
-active and healthy):
+**To recover a broken account** (example for Account-1):
 
 ```bash
-csw remove-account 1      # drop the stale/dead entry
-claude login              # sign in as that account (mints a FRESH token) — do NOT 'claude logout' first
-csw add-account           # re-capture the fresh credentials
-claude login              # sign back in as your other account (re-login, no logout)
-csw switch                # both accounts now refresh cleanly
+csw relogin 1             # sign in again as Account-1 and save the fresh session
 ```
 
 > Anthropic uses **rotating refresh tokens with reuse detection**. Each refresh

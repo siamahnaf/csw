@@ -3,7 +3,7 @@
 
 set -euo pipefail
 
-readonly CSW_VERSION="2.8.1"
+readonly CSW_VERSION="2.9.0"
 
 # Repo info (used for update checks)
 readonly CSW_REPO="siamahnaf/csw"
@@ -31,6 +31,8 @@ readonly BG_INITIAL_DELAY=5
 readonly REFRESH_FRESH_WINDOW=21600   # 6 hours
 # How long to wait for another process to release an account lock
 readonly BG_LOCK_WAIT=15
+#Session Warning
+readonly SESSION_WARN_SECONDS=259200   # 3 days
 
 # -----------------------------
 # Colors / Styled output
@@ -272,15 +274,17 @@ refresh_oauth_token() {
     return 3
   fi
 
-  local access_token expires_in new_refresh_token
+  local access_token expires_in new_refresh_token rt_expires_in
   access_token="$(printf '%s' "$body" | jq -r '.access_token // empty' 2>/dev/null)"
   expires_in="$(printf '%s' "$body" | jq -r '.expires_in // 28800' 2>/dev/null)"
   new_refresh_token="$(printf '%s' "$body" | jq -r '.refresh_token // empty' 2>/dev/null)"
+  rt_expires_in="$(printf '%s' "$body" | jq -r '.refresh_token_expires_in // empty' 2>/dev/null)"
 
   [[ -z "$access_token" ]] && { printf '%s' "$creds"; return 4; }
 
-  local expires_at
+  local expires_at rt_expires_at=""
   expires_at="$(( $(date +%s) * 1000 + expires_in * 1000 ))"
+  [[ "$rt_expires_in" =~ ^[0-9]+$ ]] && rt_expires_at="$(( $(date +%s) * 1000 + rt_expires_in * 1000 ))"
   # Keep old refresh token if server didn't issue a new one (non-rotating flow)
   [[ -z "$new_refresh_token" ]] && new_refresh_token="$refresh_token"
 
@@ -288,16 +292,57 @@ refresh_oauth_token() {
   updated_creds="$(printf '%s' "$creds" | jq -c \
     --arg  at "$access_token" \
     --argjson ea "$expires_at" \
-    --arg  rt "$new_refresh_token" '
+    --arg  rt "$new_refresh_token" \
+    --arg  rte "$rt_expires_at" '
       if .claudeAiOauth then
         .claudeAiOauth.accessToken  = $at
         | .claudeAiOauth.expiresAt  = $ea
         | .claudeAiOauth.refreshToken = $rt
+        | if $rte != "" then .claudeAiOauth.refreshTokenExpiresAt = ($rte|tonumber) else . end
       else . end
     ' 2>/dev/null)" || { printf '%s' "$creds"; return 4; }
 
   printf '%s' "$updated_creds"
   return 0
+}
+
+#Session Expiry
+session_expires_epoch() {
+  printf '%s' "$1" | jq -r '
+    (.claudeAiOauth.refreshTokenExpiresAt // empty)
+    | if type == "number" then (. / 1000 | floor) else empty end
+  ' 2>/dev/null || true
+}
+
+# Prints one of: ok | ended | expired | none
+session_state() {
+  local creds="$1" exp
+  [[ -z "$creds" ]] && { echo none; return 0; }
+  if printf '%s' "$creds" | jq -e '
+      ((.claudeAiOauth.loginEnded // "") != "") or ((.claudeAiOauth.refreshToken // "") == "")
+    ' >/dev/null 2>&1; then
+    echo ended; return 0
+  fi
+  exp="$(session_expires_epoch "$creds")"
+  if [[ -n "$exp" ]] && (( exp <= $(now_epoch) )); then echo expired; return 0; fi
+  echo ok
+}
+
+session_label() {
+  local creds="$1" num="$2" st exp left
+  st="$(session_state "$creds")"
+  case "$st" in
+    ended|expired) printf '  %s— session ended, run: csw relogin %s%s' "$RED" "$num" "$RESET"; return 0 ;;
+    none) return 0 ;;
+  esac
+  exp="$(session_expires_epoch "$creds")"
+  [[ -z "$exp" ]] && return 0
+  left=$(( exp - $(now_epoch) ))
+  if (( left < SESSION_WARN_SECONDS )); then
+    printf '  %s— expires %s, run: csw relogin %s%s' "$YELLOW" "$(human_until "$left")" "$num" "$RESET"
+  else
+    printf '  %s— expires %s%s' "$DIM" "$(epoch_to_date "$exp")" "$RESET"
+  fi
 }
 
 # -----------------------------
@@ -350,7 +395,8 @@ _rough_duration() {
   local s="$1"
   if (( s < 60 )); then       echo "${s}s"
   elif (( s < 3600 )); then   echo "$(( s / 60 ))m"
-  else                        echo "$(( s / 3600 ))h $(( (s % 3600) / 60 ))m"
+  elif (( s < 86400 )); then  echo "$(( s / 3600 ))h $(( (s % 3600) / 60 ))m"
+  else                        echo "$(( s / 86400 ))d $(( (s % 86400) / 3600 ))h"
   fi
 }
 
@@ -364,6 +410,13 @@ epoch_to_hms() {
   date -r "$e" '+%H:%M:%S' 2>/dev/null \
     || date -d "@$e" '+%H:%M:%S' 2>/dev/null \
     || echo "--:--:--"
+}
+
+epoch_to_date() {
+  local e="$1"
+  date -r "$e" '+%b %d %H:%M' 2>/dev/null \
+    || date -d "@$e" '+%b %d %H:%M' 2>/dev/null \
+    || echo "?"
 }
 
 # When the sleeping worker will fire next (epoch), or empty if not scheduled.
@@ -383,7 +436,7 @@ bg_clear_next_run_if_mine() { bg_generation_is_mine "$1" && bg_clear_next_run; r
 # Per-account status, one file per account so concurrent writers never clash.
 # Field 5 is the epoch of the transition, so `csw log` can show when each
 # account was actually refreshed without parsing the log.
-#   bg_set_status <num> <email> <PENDING|RUNNING|SUCCESS|FAILED|SKIPPED|ALREADY|CANCELLED> [detail]
+#   bg_set_status <num> <email> <PENDING|RUNNING|SUCCESS|FAILED|SKIPPED|ALREADY|EXPIRED|CANCELLED> [detail]
 bg_set_status() {
   bg_setup_dirs
   local detail; detail="$(printf '%s' "${4:-}" | tr '\t\n' '  ')"
@@ -602,7 +655,7 @@ bg_start_refresh() {
   local target_num="$1"
   bg_setup_dirs
 
-  local gen queued=0 skipped=0 num email age
+  local gen queued=0 skipped=0 expired=0 num email age st
   gen="$(now_epoch)-$$"
 
   # Bump the generation BEFORE queueing so any in-flight worker stops before
@@ -614,6 +667,14 @@ bg_start_refresh() {
     [[ -z "$num" || "$num" == "$target_num" ]] && continue
     email="$(jq -r --arg n "$num" '.accounts[$n].email // empty' "$SEQUENCE_FILE" 2>/dev/null || true)"
     [[ -z "$email" ]] && continue
+
+    st="$(session_state "$(read_account_credentials "$num" "$email")")"
+    if [[ "$st" == "ended" || "$st" == "expired" ]]; then
+      bg_set_status "$num" "$email" "EXPIRED" "run: csw relogin $num"
+      log_refresh BG "$num" "$email" "Skipped — session ended (30-day limit). Run: csw relogin $num"
+      expired=$(( expired + 1 ))
+      continue
+    fi
 
     age="$(refresh_age_seconds "$num" || true)"
     if [[ -n "$age" ]] && (( age < REFRESH_FRESH_WINDOW )); then
@@ -628,6 +689,7 @@ bg_start_refresh() {
   done < <(jq -r '.sequence[]? | tostring' "$SEQUENCE_FILE" 2>/dev/null || true)
 
   (( skipped > 0 )) && info "Skipped $skipped account(s) refreshed within the last 6 hours."
+  (( expired > 0 )) && warn "$expired account(s) need re-login (30-day session limit) — see below."
 
   if (( queued == 0 )); then
     rm -f "$BG_PID_FILE"
@@ -990,19 +1052,39 @@ cmd_add_account() {
   local current_email; current_email="$(get_current_account)"
   [[ "$current_email" == "none" ]] && { error "No active Claude account found. Please log in first."; exit 1; }
 
+  local cfg_path; cfg_path="$(get_claude_config_path)"
+
+  #Update Existing
   if account_exists "$current_email"; then
-    warn "Account $current_email is already managed."
+    local existing_num existing_creds existing_config
+    existing_num="$(get_current_managed_account_num "$current_email")"
+    existing_creds="$(sanitize_credentials_json "$(read_credentials)")"
+    if [[ "$(session_state "$existing_creds")" != "ok" ]]; then
+      error "The current session for $current_email has ended. Sign in again first: claude auth login --email $current_email"
+      exit 1
+    fi
+    existing_config="$(read_file_or_fail "$cfg_path")" || exit 1
+    existing_config="$(sanitize_config_json "$existing_config")"
+    write_account_credentials "$existing_num" "$current_email" "$existing_creds"
+    write_account_config "$existing_num" "$current_email" "$existing_config"
+    record_refresh_time "$existing_num"
+    set_active_account "$existing_num"
+    local exp; exp="$(session_expires_epoch "$existing_creds")"
+    success "Updated Account $existing_num: $current_email${exp:+ (session valid until $(epoch_to_date "$exp"))}"
     exit 0
   fi
 
   local account_num; account_num="$(get_next_account_number)"
-  local cfg_path; cfg_path="$(get_claude_config_path)"
 
   local current_creds current_config
   current_creds="$(read_credentials)"
   current_config="$(read_file_or_fail "$cfg_path")" || exit 1
 
   [[ -z "$current_creds" ]] && { error "No credentials found/readable for current account (Keychain service mismatch or permissions)."; exit 1; }
+  if [[ "$(session_state "$current_creds")" != "ok" ]]; then
+    error "The current session for $current_email has ended. Sign in again first: claude auth login --email $current_email"
+    exit 1
+  fi
 
   # Sanitize both credentials and config before storing backup
   # (prevents auth conflict when backup is restored during a switch)
@@ -1103,15 +1185,18 @@ cmd_list() {
   fi
 
   title "Accounts:"
-  jq -r --arg active "$active_account_num" '
-    .sequence[]? as $num
-    | .accounts[($num|tostring)]
-    | if ($active != "" and ($num|tostring) == $active) then
-        "  \($num): \(.email) (active)"
-      else
-        "  \($num): \(.email)"
-      end
-  ' "$SEQUENCE_FILE"
+  local num email creds line
+  while IFS=$'\t' read -r num email; do
+    [[ -z "$num" || -z "$email" ]] && continue
+    line="  $num: $email"
+    if [[ -n "$active_account_num" && "$num" == "$active_account_num" ]]; then
+      line="$line (active)"
+      creds="$(read_credentials)"
+    else
+      creds="$(read_account_credentials "$num" "$email")"
+    fi
+    printf '%s%s\n' "$line" "$(session_label "$creds" "$num")"
+  done < <(jq -r '.sequence[]? as $n | "\($n)\t\(.accounts[($n|tostring)].email // "")"' "$SEQUENCE_FILE" 2>/dev/null || true)
 }
 
 get_next_in_sequence() {
@@ -1149,23 +1234,38 @@ cmd_switch() {
   perform_switch "$next_account"
 }
 
+resolve_account_arg() {
+  local identifier="$1" num
+  if [[ "$identifier" =~ ^[0-9]+$ ]]; then
+    num="$identifier"
+  else
+    validate_email "$identifier" || { error "Invalid email format: $identifier"; exit 1; }
+    num="$(resolve_account_identifier "$identifier")"
+    [[ -z "$num" ]] && { error "No account found with email: $identifier"; exit 1; }
+  fi
+  local account_info; account_info="$(jq -r --arg num "$num" '.accounts[$num] // empty' "$SEQUENCE_FILE")"
+  [[ -z "$account_info" ]] && { error "Account-$num does not exist"; exit 1; }
+  printf '%s' "$num"
+}
+
 cmd_switch_to() {
   [[ $# -eq 0 ]] && { error "Usage: $0 --switch-to <account_number|email>"; exit 1; }
   [[ ! -f "$SEQUENCE_FILE" ]] && { error "No accounts are managed yet"; exit 1; }
 
-  local identifier="$1" target_account
-  if [[ "$identifier" =~ ^[0-9]+$ ]]; then
-    target_account="$identifier"
-  else
-    validate_email "$identifier" || { error "Invalid email format: $identifier"; exit 1; }
-    target_account="$(resolve_account_identifier "$identifier")"
-    [[ -z "$target_account" ]] && { error "No account found with email: $identifier"; exit 1; }
-  fi
-
-  local account_info; account_info="$(jq -r --arg num "$target_account" '.accounts[$num] // empty' "$SEQUENCE_FILE")"
-  [[ -z "$account_info" ]] && { error "Account-$target_account does not exist"; exit 1; }
-
+  local target_account; target_account="$(resolve_account_arg "$1")"
   perform_switch "$target_account"
+}
+
+cmd_relogin() {
+  [[ $# -eq 0 ]] && { error "Usage: $0 --relogin <account_number|email>"; exit 1; }
+  [[ ! -f "$SEQUENCE_FILE" ]] && { error "No accounts are managed yet"; exit 1; }
+
+  local target_account; target_account="$(resolve_account_arg "$1")"
+  local target_email
+  target_email="$(jq -r --arg num "$target_account" '.accounts[$num].email // empty' "$SEQUENCE_FILE")"
+  wait_for_claude_close
+  perform_relogin "$target_account" "$target_email"
+  finish_switch "$target_account"
 }
 
 get_current_managed_account_num() {
@@ -1176,17 +1276,12 @@ get_current_managed_account_num() {
   ' "$SEQUENCE_FILE" 2>/dev/null | head -n 1
 }
 
-perform_switch() {
-  local target_account="$1"
-  wait_for_claude_close
-
-  local target_email
-  target_email="$(jq -r --arg num "$target_account" '.accounts[$num].email // empty' "$SEQUENCE_FILE")"
-  [[ -z "$target_email" ]] && { error "Could not resolve target account email."; exit 1; }
-
+#Backup Current
+backup_current_account() {
   local current_email; current_email="$(get_current_account)"
   local current_account; current_account="$(get_current_managed_account_num "$current_email")"
   [[ -z "$current_account" ]] && current_account="$(jq -r '.activeAccountNumber // empty' "$SEQUENCE_FILE")"
+  [[ -z "$current_account" || "$current_account" == "null" || "$current_email" == "none" ]] && return 0
 
   local cfg_path; cfg_path="$(get_claude_config_path)"
   local current_creds current_config
@@ -1196,18 +1291,110 @@ perform_switch() {
   current_creds="$(sanitize_credentials_json "$current_creds")"
   current_config="$(sanitize_config_json "$current_config")"
 
-  if [[ -n "$current_account" && "$current_account" != "null" && "$current_email" != "none" ]]; then
-    step "Saving current account backup..."
-    if [[ -n "$current_creds" ]]; then
+  step "Saving current account backup..."
+  case "$(session_state "$current_creds")" in
+    ok)
       if ! write_account_credentials "$current_account" "$current_email" "$current_creds"; then
         warn "Failed to save credentials for Account-$current_account; skipping credentials backup."
       fi
-    else
+      ;;
+    none)
       warn "Could not read current credentials; skipping credentials backup."
-    fi
-    write_account_config "$current_account" "$current_email" "$current_config"
-    success "Backed up: Account-$current_account ($current_email)"
+      ;;
+    *)
+      warn "Account-$current_account session has ended (30-day limit) — kept the existing backup."
+      info "Re-login later with: csw relogin $current_account"
+      ;;
+  esac
+  write_account_config "$current_account" "$current_email" "$current_config"
+  success "Backed up: Account-$current_account ($current_email)"
+}
+
+set_active_account() {
+  local now; now="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+  local updated
+  updated="$(jq --arg num "$1" --arg now "$now" '
+    .activeAccountNumber = ($num|tonumber)
+    | .lastUpdated = $now
+  ' "$SEQUENCE_FILE")"
+  write_json "$SEQUENCE_FILE" "$updated"
+}
+
+confirm_relogin() {
+  local num="$1" email="$2"
+  [[ -t 0 ]] || return 1
+  printf "%s%sRe-login Account-%s (%s) now?%s [Y/n] " "$CYAN" "$BOLD" "$num" "$email" "$RESET"
+  local ans; read -r ans
+  [[ "$ans" != "n" && "$ans" != "N" ]]
+}
+
+#Relogin
+perform_relogin() {
+  local target_account="$1" target_email="$2"
+  backup_current_account
+
+  step "Signing in as $target_email..."
+  info "Your browser will open — approve the login as $target_email."
+  if ! claude auth login --email "$target_email"; then
+    error "Login failed or was cancelled. Nothing was changed for Account-$target_account."
+    exit 1
   fi
+
+  local new_email new_creds new_config cfg_path
+  cfg_path="$(get_claude_config_path)"
+  new_email="$(get_current_account)"
+  new_creds="$(sanitize_credentials_json "$(read_credentials)")"
+  new_config="$(read_file_or_fail "$cfg_path")" || exit 1
+  new_config="$(sanitize_config_json "$new_config")"
+
+  if [[ "$(session_state "$new_creds")" != "ok" ]]; then
+    error "Login finished but no usable credentials were found."
+    exit 1
+  fi
+
+  if [[ "$new_email" != "$target_email" ]]; then
+    local other; other="$(get_current_managed_account_num "$new_email")"
+    error "Signed in as $new_email, but Account-$target_account is $target_email."
+    if [[ -n "$other" ]]; then
+      write_account_credentials "$other" "$new_email" "$new_creds"
+      write_account_config "$other" "$new_email" "$new_config"
+      record_refresh_time "$other"
+      set_active_account "$other"
+      info "Saved the fresh session to Account-$other instead."
+    fi
+    info "Sign out of claude.ai in your browser (or use a private window), then run: csw relogin $target_account"
+    exit 1
+  fi
+
+  write_account_credentials "$target_account" "$target_email" "$new_creds"
+  write_account_config "$target_account" "$target_email" "$new_config"
+  record_refresh_time "$target_account"
+  set_active_account "$target_account"
+  bg_set_status "$target_account" "$target_email" "SUCCESS" "Re-logged in"
+  log_refresh FG "$target_account" "$target_email" "Re-logged in — new session saved."
+
+  local exp; exp="$(session_expires_epoch "$new_creds")"
+  success "Account-$target_account re-logged in${exp:+ — session valid until $(epoch_to_date "$exp")}."
+}
+
+finish_switch() {
+  local target_account="$1"
+  step "Starting background refresh for other accounts..."
+  bg_start_refresh "$target_account"
+
+  cmd_list
+  echo ""
+  warn "Please restart Claude Code to use the new authentication."
+  echo ""
+}
+
+perform_switch() {
+  local target_account="$1"
+  wait_for_claude_close
+
+  local target_email
+  target_email="$(jq -r --arg num "$target_account" '.accounts[$num].email // empty' "$SEQUENCE_FILE")"
+  [[ -z "$target_email" ]] && { error "Could not resolve target account email."; exit 1; }
 
   local target_creds target_config
   target_creds="$(read_account_credentials "$target_account" "$target_email")"
@@ -1217,15 +1404,27 @@ perform_switch() {
   # (handles old backups that may have been stored without sanitization)
   target_creds="$(sanitize_credentials_json "$target_creds")"
 
-  # Proactively refresh the OAuth token so restored credentials are always
-  # current regardless of how long ago this account was last used.
-  # If the refresh succeeds the new accessToken/expiresAt/refreshToken are
-  # used; if it fails for any reason the stored credentials are used as-is
-  # (same behaviour as before — works until the stored accessToken expires).
   # Clear log file — csw log only shows the current switch run
   printf '' > "$LOG_FILE"
   bg_setup_dirs
   printf '%s\n' "$(now_epoch)" > "$BG_DIR/last-switch"
+
+  #Expired Target
+  local target_state; target_state="$(session_state "$target_creds")"
+  if [[ "$target_state" == "ended" || "$target_state" == "expired" ]]; then
+    bg_set_status "$target_account" "$target_email" "EXPIRED" "run: csw relogin $target_account"
+    log_refresh FG "$target_account" "$target_email" "Skipped — session ended (30-day limit)."
+    warn "Account-$target_account ($target_email) reached Claude's 30-day session limit."
+    if confirm_relogin "$target_account" "$target_email"; then
+      perform_relogin "$target_account" "$target_email"
+      finish_switch "$target_account"
+      return 0
+    fi
+    error "Switch cancelled — nothing changed. Re-login with: csw relogin $target_account"
+    exit 1
+  fi
+
+  backup_current_account
 
   step "Refreshing OAuth token for Account-$target_account..."
   # Take the account lock so a background worker from an earlier switch can
@@ -1240,7 +1439,7 @@ perform_switch() {
   fi
 
   local fg_msg_file; fg_msg_file="$(mktemp)"
-  local refreshed_creds refresh_rc=0
+  local refreshed_creds refresh_rc=0 needs_login=0
   if (( fg_locked )); then
     refreshed_creds="$(refresh_oauth_token "$target_creds" "$fg_msg_file")" || refresh_rc=$?
   else
@@ -1295,7 +1494,11 @@ perform_switch() {
       if [[ -n "$requests_remaining" ]]; then
         info "Requests remaining: ${requests_remaining}"
       fi
-      info "Re-login with: claude login"
+      if printf '%s' "$raw_response" | grep -q 'invalid_grant'; then
+        needs_login=1
+      else
+        info "Re-login with: csw relogin $target_account"
+      fi
       ;;
     4)
       bg_set_status "$target_account" "$target_email" "FAILED" "Invalid server response"
@@ -1311,8 +1514,22 @@ perform_switch() {
   rm -f "$fg_msg_file"
   (( fg_locked )) && acct_lock_release "$target_account"
 
+  #Rejected Token
+  if (( needs_login )); then
+    warn "Account-$target_account needs a fresh login."
+    if confirm_relogin "$target_account" "$target_email"; then
+      perform_relogin "$target_account" "$target_email"
+      finish_switch "$target_account"
+      return 0
+    fi
+    error "Switch cancelled — you are still on the previous account. Re-login with: csw relogin $target_account"
+    exit 1
+  fi
+
   step "Applying target credentials/config..."
   write_credentials "$target_creds"
+
+  local cfg_path; cfg_path="$(get_claude_config_path)"
 
   local oauth_section
   oauth_section="$(printf '%s' "$target_config" | jq '.oauthAccount' 2>/dev/null || true)"
@@ -1332,14 +1549,7 @@ perform_switch() {
   [[ $merge_rc -ne 0 || -z "$merged_config" ]] && { error "Failed to merge config"; exit 1; }
 
   write_json "$cfg_path" "$merged_config"
-
-  local now; now="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
-  local updated
-  updated="$(jq --arg num "$target_account" --arg now "$now" '
-    .activeAccountNumber = ($num|tonumber)
-    | .lastUpdated = $now
-  ' "$SEQUENCE_FILE")"
-  write_json "$SEQUENCE_FILE" "$updated"
+  set_active_account "$target_account"
 
   success "Switched to Account-$target_account ($target_email)"
 
@@ -1356,13 +1566,7 @@ perform_switch() {
   # mid-refresh. Do not add a `kill` to the cancellation path — killing a
   # worker between "server rotated the token" and "token saved to backup" is
   # exactly what strands an account needing `claude login`.
-  step "Starting background refresh for other accounts..."
-  bg_start_refresh "$target_account"
-
-  cmd_list
-  echo ""
-  warn "Please restart Claude Code to use the new authentication."
-  echo ""
+  finish_switch "$target_account"
 }
 
 # -----------------------------
@@ -1421,6 +1625,7 @@ _status_display() {
     ALREADY)   _st_word="Fresh";     _st_color="$BLUE";   _st_note="refreshed ${detail:-recently}" ;;
     SKIPPED)   _st_word="Skipped";   _st_color="$YELLOW" ;;
     FAILED)    _st_word="Failed";    _st_color="$RED" ;;
+    EXPIRED)   _st_word="Expired";   _st_color="$RED" ;;
     CANCELLED) _st_word="Cancelled"; _st_color="$DIM";    _st_note="superseded" ;;
     *)         _st_word="${status:-Not queued}"; _st_color="$DIM" ;;
   esac
@@ -1611,7 +1816,8 @@ show_usage() {
   dimln "Usage: $0 [COMMAND]"
   echo ""
   title "Commands:"
-  dimln "  --add-account                    Add current account to managed accounts"
+  dimln "  --add-account                    Add current account (or update it if already managed)"
+  dimln "  --relogin <num|email>            Sign in again to an account and save the new session"
   dimln "  --remove-account <num|email>     Remove account by number or email"
   dimln "  --list                           List all managed accounts"
   dimln "  --switch                         Rotate to next account in sequence"
@@ -1640,6 +1846,7 @@ main() {
   --list|list|ls) cmd_list ;;
   --switch|switch|next) cmd_switch ;;
   --switch-to|switch-to|to) shift; cmd_switch_to "$@" ;;
+  --relogin|relogin|login) shift; cmd_relogin "$@" ;;
   --log|log) shift; cmd_log "$@" ;;
   # Internal: entry point for the detached background refresh worker.
   # Not listed in --help; invoked only by bg_start_refresh.

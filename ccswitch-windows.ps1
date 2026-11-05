@@ -3,7 +3,7 @@
 
 $ErrorActionPreference = "Stop"
 
-$CSW_VERSION        = "2.8.1"
+$CSW_VERSION        = "2.9.0"
 $CSW_REPO           = "siamahnaf/csw"
 $CSW_DEFAULT_BRANCH = "main"
 
@@ -33,6 +33,8 @@ $BG_INITIAL_DELAY     = 5
 $REFRESH_FRESH_WINDOW = 21600
 # How long to wait for another process to release an account lock
 $BG_LOCK_WAIT         = 15
+#Session Warning
+$SESSION_WARN_SECONDS = 259200
 
 # ---------------------------------------------------------------------------
 # Output helpers
@@ -407,6 +409,7 @@ function Invoke-OAuthRefresh {
         $accessToken = $ro.access_token
         $expiresIn   = if ($ro.expires_in) { [long]$ro.expires_in } else { 28800 }
         $newRT       = $ro.refresh_token
+        $rtExpiresIn = $ro.refresh_token_expires_in
     } catch {
         Write-RefreshLog $Scope $AccountNum $Email "Invalid response body"
         return @{ Status = 4; Credentials = $Credentials }
@@ -425,6 +428,10 @@ function Invoke-OAuthRefresh {
         $obj.claudeAiOauth.accessToken  = $accessToken
         $obj.claudeAiOauth.expiresAt    = $expiresAt
         $obj.claudeAiOauth.refreshToken = $newRT
+        if ("$rtExpiresIn" -match '^\d+$') {
+            $rtExpiresAt = [DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds() + ([long]$rtExpiresIn * 1000)
+            $obj.claudeAiOauth | Add-Member -MemberType NoteProperty -Name "refreshTokenExpiresAt" -Value $rtExpiresAt -Force
+        }
         $updated = $obj | ConvertTo-Json -Depth 20 -Compress
     } catch {
         Write-RefreshLog $Scope $AccountNum $Email "Failed to patch credentials object"
@@ -516,7 +523,8 @@ function Format-Duration {
     param([long]$Seconds)
     if ($Seconds -lt 60)   { return "${Seconds}s" }
     if ($Seconds -lt 3600) { return "$([math]::Floor($Seconds / 60))m" }
-    return "$([math]::Floor($Seconds / 3600))h $([math]::Floor(($Seconds % 3600) / 60))m"
+    if ($Seconds -lt 86400) { return "$([math]::Floor($Seconds / 3600))h $([math]::Floor(($Seconds % 3600) / 60))m" }
+    return "$([math]::Floor($Seconds / 86400))d $([math]::Floor(($Seconds % 86400) / 3600))h"
 }
 
 function Format-Ago { param([long]$Seconds) return "$(Format-Duration $Seconds) ago" }
@@ -566,6 +574,50 @@ function Format-Until {
     param([long]$Seconds)
     if ($Seconds -le 0) { return "now" }
     return "in $(Format-Duration $Seconds)"
+}
+
+function Format-EpochDate {
+    param([long]$Epoch)
+    return [DateTimeOffset]::FromUnixTimeSeconds($Epoch).ToLocalTime().ToString("MMM dd HH:mm")
+}
+
+#Session Expiry
+function Get-SessionExpiresEpoch {
+    param([string]$Credentials)
+    try {
+        $v = ($Credentials | ConvertFrom-Json).claudeAiOauth.refreshTokenExpiresAt
+        if ($null -eq $v) { return $null }
+        return [long][math]::Floor([double]$v / 1000)
+    } catch { return $null }
+}
+
+# Returns one of: ok | ended | expired | none
+function Get-SessionState {
+    param([string]$Credentials)
+    if ([string]::IsNullOrEmpty($Credentials)) { return "none" }
+    try { $o = ($Credentials | ConvertFrom-Json).claudeAiOauth } catch { return "ok" }
+    if ($null -eq $o -or -not [string]::IsNullOrEmpty("$($o.loginEnded)") -or [string]::IsNullOrEmpty("$($o.refreshToken)")) {
+        return "ended"
+    }
+    $exp = Get-SessionExpiresEpoch $Credentials
+    if ($null -ne $exp -and $exp -le (Get-NowEpoch)) { return "expired" }
+    return "ok"
+}
+
+function Get-SessionLabel {
+    param([string]$Credentials, [string]$Num)
+    $st = Get-SessionState $Credentials
+    if ($st -eq "ended" -or $st -eq "expired") {
+        return @{ Text = "  - session ended, run: csw relogin $Num"; Color = "Red" }
+    }
+    if ($st -eq "none") { return $null }
+    $exp = Get-SessionExpiresEpoch $Credentials
+    if ($null -eq $exp) { return $null }
+    $left = $exp - (Get-NowEpoch)
+    if ($left -lt $SESSION_WARN_SECONDS) {
+        return @{ Text = "  - expires $(Format-Until $left), run: csw relogin $Num"; Color = "Yellow" }
+    }
+    return @{ Text = "  - expires $(Format-EpochDate $exp)"; Color = "DarkGray" }
 }
 
 function Get-BgStatus {
@@ -788,7 +840,7 @@ function Start-BgRefresh {
     $seq = Get-SequenceData
     if ($null -eq $seq) { return }
 
-    $queued = 0; $skipped = 0
+    $queued = 0; $skipped = 0; $expired = 0
     foreach ($n in @($seq.sequence)) {
         $num = "$n"
         if ($num -eq "$TargetNum") { continue }
@@ -796,6 +848,14 @@ function Start-BgRefresh {
         if ($null -eq $p) { continue }
         $email = $p.Value.email
         if ([string]::IsNullOrEmpty($email)) { continue }
+
+        $st = Get-SessionState (Read-AccountCredentials $num $email)
+        if ($st -eq "ended" -or $st -eq "expired") {
+            Set-BgStatus $num $email "EXPIRED" "run: csw relogin $num"
+            Write-RefreshLog "BG" $num $email "Skipped - session ended (30-day limit). Run: csw relogin $num"
+            $expired++
+            continue
+        }
 
         $age = Get-RefreshAgeSeconds $num
         if ($null -ne $age -and $age -lt $REFRESH_FRESH_WINDOW) {
@@ -811,6 +871,9 @@ function Start-BgRefresh {
 
     if ($skipped -gt 0) {
         Write-CSWInfo "Skipped $skipped account(s) refreshed within the last 6 hours."
+    }
+    if ($expired -gt 0) {
+        Write-CSWWarn "$expired account(s) need re-login (30-day session limit) - see below."
     }
     if ($queued -eq 0) {
         Remove-Item $BG_PID_FILE -Force -ErrorAction SilentlyContinue
@@ -840,6 +903,105 @@ function Start-BgRefresh {
 # ---------------------------------------------------------------------------
 # perform_switch — core logic
 # ---------------------------------------------------------------------------
+#Backup Current
+function Backup-CurrentAccount {
+    $seq          = Get-SequenceData
+    $cfgPath      = Get-ClaudeConfigPath
+    $currentEmail = Get-CurrentAccount
+    $currentNum   = Get-CurrentManagedAccountNum $currentEmail
+    if ([string]::IsNullOrEmpty($currentNum) -and $null -ne $seq) { $currentNum = "$($seq.activeAccountNumber)" }
+    if ([string]::IsNullOrEmpty($currentNum) -or $currentNum -eq "null" -or $currentEmail -eq "none") { return }
+
+    Write-CSWStep "Saving current account backup..."
+    $liveCreds = Get-SanitizedCredentials (Read-LiveCredentials)
+    switch (Get-SessionState $liveCreds) {
+        "ok"   { Write-AccountCredentials $currentNum $currentEmail $liveCreds }
+        "none" { Write-CSWWarn "Could not read current credentials; skipping credentials backup." }
+        default {
+            Write-CSWWarn "Account-$currentNum session has ended (30-day limit) - kept the existing backup."
+            Write-CSWInfo "Re-login later with: csw relogin $currentNum"
+        }
+    }
+    if (Test-Path $cfgPath) {
+        Write-AccountConfig $currentNum $currentEmail (Get-SanitizedConfig (Get-Content $cfgPath -Raw))
+    }
+    Write-CSWSuccess "Backed up: Account-$currentNum ($currentEmail)"
+}
+
+function Set-ActiveAccount {
+    param([string]$Num)
+    $seq = Get-SequenceData
+    $seq.activeAccountNumber = [int]$Num
+    Save-SequenceData $seq
+}
+
+function Confirm-Relogin {
+    param([string]$Num, [string]$Email)
+    if ([Console]::IsInputRedirected) { return $false }
+    $ans = Read-Host "Re-login Account-$Num ($Email) now? [Y/n]"
+    return ($ans -ne "n" -and $ans -ne "N")
+}
+
+#Relogin
+function Invoke-PerformRelogin {
+    param([string]$TargetNum, [string]$TargetEmail)
+    Backup-CurrentAccount
+
+    Write-CSWStep "Signing in as $TargetEmail..."
+    Write-CSWInfo "Your browser will open - approve the login as $TargetEmail."
+    & claude auth login --email $TargetEmail
+    if ($LASTEXITCODE -ne 0) {
+        Write-CSWError "Login failed or was cancelled. Nothing was changed for Account-$TargetNum."
+        exit 1
+    }
+
+    $cfgPath   = Get-ClaudeConfigPath
+    $newEmail  = Get-CurrentAccount
+    $newCreds  = Get-SanitizedCredentials (Read-LiveCredentials)
+    $newConfig = if (Test-Path $cfgPath) { Get-SanitizedConfig (Get-Content $cfgPath -Raw) } else { "" }
+
+    if ((Get-SessionState $newCreds) -ne "ok") {
+        Write-CSWError "Login finished but no usable credentials were found."
+        exit 1
+    }
+
+    if ($newEmail -ne $TargetEmail) {
+        $other = Get-CurrentManagedAccountNum $newEmail
+        Write-CSWError "Signed in as $newEmail, but Account-$TargetNum is $TargetEmail."
+        if (-not [string]::IsNullOrEmpty($other)) {
+            Write-AccountCredentials $other $newEmail $newCreds
+            if ($newConfig) { Write-AccountConfig $other $newEmail $newConfig }
+            Set-RefreshStamp $other
+            Set-ActiveAccount $other
+            Write-CSWInfo "Saved the fresh session to Account-$other instead."
+        }
+        Write-CSWInfo "Sign out of claude.ai in your browser (or use a private window), then run: csw relogin $TargetNum"
+        exit 1
+    }
+
+    Write-AccountCredentials $TargetNum $TargetEmail $newCreds
+    if ($newConfig) { Write-AccountConfig $TargetNum $TargetEmail $newConfig }
+    Set-RefreshStamp $TargetNum
+    Set-ActiveAccount $TargetNum
+    Set-BgStatus $TargetNum $TargetEmail "SUCCESS" "Re-logged in"
+    Write-RefreshLog "FG" $TargetNum $TargetEmail "Re-logged in - new session saved."
+
+    $exp = Get-SessionExpiresEpoch $newCreds
+    $until = if ($null -ne $exp) { " - session valid until $(Format-EpochDate $exp)" } else { "" }
+    Write-CSWSuccess "Account-$TargetNum re-logged in$until."
+}
+
+function Complete-Switch {
+    param([string]$TargetNum)
+    Write-CSWStep "Starting background refresh for other accounts..."
+    Start-BgRefresh $TargetNum
+
+    Invoke-List
+    Write-Host ""
+    Write-CSWWarn "Please restart Claude Code to use the new authentication."
+    Write-Host ""
+}
+
 function Invoke-PerformSwitch {
     param([string]$TargetNum)
 
@@ -852,25 +1014,7 @@ function Invoke-PerformSwitch {
     if ($null -eq $targetProp) { Write-CSWError "Account-$TargetNum not found."; exit 1 }
     $targetEmail = $targetProp.Value.email
 
-    $cfgPath      = Get-ClaudeConfigPath
-    $currentEmail = Get-CurrentAccount
-    $currentNum   = Get-CurrentManagedAccountNum $currentEmail
-    if ([string]::IsNullOrEmpty($currentNum)) { $currentNum = "$($seq.activeAccountNumber)" }
-
-    # Backup current account
-    if (-not [string]::IsNullOrEmpty($currentNum) -and $currentNum -ne "null" -and $currentEmail -ne "none") {
-        Write-CSWStep "Saving current account backup..."
-        $liveCreds = Read-LiveCredentials
-        if (-not [string]::IsNullOrEmpty($liveCreds)) {
-            Write-AccountCredentials $currentNum $currentEmail (Get-SanitizedCredentials $liveCreds)
-        } else {
-            Write-CSWWarn "Could not read current credentials; skipping credentials backup."
-        }
-        if (Test-Path $cfgPath) {
-            Write-AccountConfig $currentNum $currentEmail (Get-SanitizedConfig (Get-Content $cfgPath -Raw))
-        }
-        Write-CSWSuccess "Backed up: Account-$currentNum ($currentEmail)"
-    }
+    $cfgPath = Get-ClaudeConfigPath
 
     # Load target data
     $targetCreds  = Read-AccountCredentials $TargetNum $targetEmail
@@ -885,6 +1029,24 @@ function Invoke-PerformSwitch {
     Set-Content -Path $LOG_FILE -Value "" -Encoding UTF8 -Force
     Initialize-BgDirs
     Set-Content -Path $BG_LAST_SWITCH -Value (Get-NowEpoch) -Encoding UTF8 -Force
+
+    #Expired Target
+    $targetState = Get-SessionState $targetCreds
+    if ($targetState -eq "ended" -or $targetState -eq "expired") {
+        Set-BgStatus $TargetNum $targetEmail "EXPIRED" "run: csw relogin $TargetNum"
+        Write-RefreshLog "FG" $TargetNum $targetEmail "Skipped - session ended (30-day limit)."
+        Write-CSWWarn "Account-$TargetNum ($targetEmail) reached Claude's 30-day session limit."
+        if (Confirm-Relogin $TargetNum $targetEmail) {
+            Invoke-PerformRelogin $TargetNum $targetEmail
+            Complete-Switch $TargetNum
+            return
+        }
+        Write-CSWError "Switch cancelled - nothing changed. Re-login with: csw relogin $TargetNum"
+        exit 1
+    }
+
+    Backup-CurrentAccount
+    $needsLogin = $false
 
     # Foreground OAuth refresh. Take the account lock first so a background
     # worker from an earlier switch can never refresh this same account at the
@@ -923,7 +1085,11 @@ function Invoke-PerformSwitch {
             Write-CSWWarn "Token refresh failed - HTTP $($result.HttpStatus)."
             if ($result.RetryAfter) { Write-CSWInfo "Retry after: $($result.RetryAfter) seconds." }
             if ($result.RateReset)  { Write-CSWInfo "Rate limit resets at: $($result.RateReset)" }
-            Write-CSWInfo "Re-login with: claude login"
+            if ("$($result.Body)" -match 'invalid_grant') {
+                $needsLogin = $true
+            } else {
+                Write-CSWInfo "Re-login with: csw relogin $TargetNum"
+            }
         }
         4 {
             Set-BgStatus $TargetNum $targetEmail "FAILED" "Invalid server response"
@@ -932,6 +1098,18 @@ function Invoke-PerformSwitch {
         5 { Write-CSWInfo "Using stored credentials as-is (refresh skipped - account was locked)." }
     }
     if ($fgLocked) { Unlock-Account $TargetNum }
+
+    #Rejected Token
+    if ($needsLogin) {
+        Write-CSWWarn "Account-$TargetNum needs a fresh login."
+        if (Confirm-Relogin $TargetNum $targetEmail) {
+            Invoke-PerformRelogin $TargetNum $targetEmail
+            Complete-Switch $TargetNum
+            return
+        }
+        Write-CSWError "Switch cancelled - you are still on the previous account. Re-login with: csw relogin $TargetNum"
+        exit 1
+    }
 
     # Apply credentials
     Write-CSWStep "Applying target credentials/config..."
@@ -958,9 +1136,7 @@ function Invoke-PerformSwitch {
         }
     }
 
-    # Update sequence
-    $seq.activeAccountNumber = [int]$TargetNum
-    Save-SequenceData $seq
+    Set-ActiveAccount $TargetNum
     Write-CSWSuccess "Switched to Account-$TargetNum ($targetEmail)"
 
     # Warm every other account's token in the background, one at a time.
@@ -975,13 +1151,7 @@ function Invoke-PerformSwitch {
     # cancellation path - killing a worker between "server rotated the token"
     # and "token saved to backup" is exactly what strands an account needing
     # `claude login`.
-    Write-CSWStep "Starting background refresh for other accounts..."
-    Start-BgRefresh $TargetNum
-
-    Invoke-List
-    Write-Host ""
-    Write-CSWWarn "Please restart Claude Code to use the new authentication."
-    Write-Host ""
+    Complete-Switch $TargetNum
 }
 
 # ---------------------------------------------------------------------------
@@ -996,17 +1166,35 @@ function Invoke-AddAccount {
         Write-CSWError "No active Claude account found. Please log in with 'claude login' first."
         exit 1
     }
-    if (Test-AccountExists $email) { Write-CSWWarn "Account $email is already managed."; exit 0 }
-
-    $cfgPath    = Get-ClaudeConfigPath
-    $accountNum = Get-NextAccountNumber
-
+    $cfgPath   = Get-ClaudeConfigPath
     $liveCreds = Read-LiveCredentials
     if ([string]::IsNullOrEmpty($liveCreds)) {
         Write-CSWError "No credentials found. Please log in with 'claude login' first."
         exit 1
     }
-    Write-AccountCredentials "$accountNum" $email (Get-SanitizedCredentials $liveCreds)
+    $liveCreds = Get-SanitizedCredentials $liveCreds
+    if ((Get-SessionState $liveCreds) -ne "ok") {
+        Write-CSWError "The current session for $email has ended. Sign in again first: claude auth login --email $email"
+        exit 1
+    }
+
+    #Update Existing
+    if (Test-AccountExists $email) {
+        $existingNum = Get-CurrentManagedAccountNum $email
+        Write-AccountCredentials $existingNum $email $liveCreds
+        if (Test-Path $cfgPath) {
+            Write-AccountConfig $existingNum $email (Get-SanitizedConfig (Get-Content $cfgPath -Raw))
+        }
+        Set-RefreshStamp $existingNum
+        Set-ActiveAccount $existingNum
+        $exp = Get-SessionExpiresEpoch $liveCreds
+        $until = if ($null -ne $exp) { " (session valid until $(Format-EpochDate $exp))" } else { "" }
+        Write-CSWSuccess "Updated Account ${existingNum}: $email$until"
+        exit 0
+    }
+
+    $accountNum = Get-NextAccountNumber
+    Write-AccountCredentials "$accountNum" $email $liveCreds
 
     if (Test-Path $cfgPath) {
         Write-AccountConfig "$accountNum" $email (Get-SanitizedConfig (Get-Content $cfgPath -Raw))
@@ -1064,7 +1252,10 @@ function Invoke-List {
         $isAct  = ($activeNum -eq $num)
         $marker = if ($isAct) { " (active)" } else { "" }
         $color  = if ($isAct) { "Green" } else { "White" }
-        Write-Host ("  {0}: {1}{2}" -f $num, $p.Value.email, $marker) -ForegroundColor $color
+        $creds  = if ($isAct) { Read-LiveCredentials } else { Read-AccountCredentials $num $p.Value.email }
+        $label  = Get-SessionLabel $creds $num
+        Write-Host ("  {0}: {1}{2}" -f $num, $p.Value.email, $marker) -ForegroundColor $color -NoNewline
+        if ($null -ne $label) { Write-Host $label.Text -ForegroundColor $label.Color } else { Write-Host "" }
     }
 }
 
@@ -1102,6 +1293,19 @@ function Invoke-SwitchTo {
     $acct = Resolve-AccountIdentifier $Identifier
     if ($null -eq $acct) { Write-CSWError "No account found for '$Identifier'. Run: csw list"; exit 1 }
     Invoke-PerformSwitch $acct.Number
+}
+
+function Invoke-Relogin {
+    param([string]$Identifier)
+    if ([string]::IsNullOrEmpty($Identifier)) {
+        Write-CSWError "Usage: csw relogin <account_number|email>"; exit 1
+    }
+    if (-not (Test-Path $SEQUENCE_FILE)) { Write-CSWError "No accounts are managed yet."; exit 1 }
+    $acct = Resolve-AccountIdentifier $Identifier
+    if ($null -eq $acct) { Write-CSWError "No account found for '$Identifier'. Run: csw list"; exit 1 }
+    Wait-ClaudeClose
+    Invoke-PerformRelogin $acct.Number $acct.Email
+    Complete-Switch $acct.Number
 }
 
 # ---------------------------------------------------------------------------
@@ -1152,6 +1356,7 @@ function Get-StatusDisplay {
                       return @{ Word = "Fresh";     Color = "Blue";     Note = $n } }
         "SKIPPED"   { return @{ Word = "Skipped";   Color = "Yellow";   Note = $Detail } }
         "FAILED"    { return @{ Word = "Failed";    Color = "Red";      Note = $Detail } }
+        "EXPIRED"   { return @{ Word = "Expired";   Color = "Red";      Note = $Detail } }
         "CANCELLED" { return @{ Word = "Cancelled"; Color = "DarkGray"; Note = "superseded" } }
         default     {
             $w = if ($Status) { $Status } else { "Not queued" }
@@ -1416,8 +1621,9 @@ function Show-Usage {
     Write-Host ""
     Write-CSWTitle "Commands:"
     @(
-        @("  add-account",              "Add the currently logged-in Claude Code account"),
-        @("  list | ls",                "List all managed accounts"),
+        @("  add-account",              "Add the logged-in account (or update it if already managed)"),
+        @("  relogin <n|email>",        "Sign in again to an account and save the new session"),
+        @("  list | ls",                "List all managed accounts with session expiry"),
         @("  switch | next",            "Rotate to the next account in sequence"),
         @("  switch-to <n|email>",      "Switch to a specific account by number or email"),
         @("  remove-account <n|email>", "Remove a managed account (with confirmation)"),
@@ -1441,6 +1647,7 @@ switch ($cmd) {
     { $_ -in @("list","ls","--list","--ls") }                                { Invoke-List }
     { $_ -in @("switch","next","--switch") }                                 { Invoke-Switch }
     { $_ -in @("switch-to","--switch-to","to") }                             { Invoke-SwitchTo $arg1 }
+    { $_ -in @("relogin","--relogin","login") }                              { Invoke-Relogin $arg1 }
     { $_ -in @("remove-account","rm-account","--remove-account","--rm-account") } { Invoke-RemoveAccount $arg1 }
     { $_ -in @("log","--log") }                                              { Invoke-Log $arg1 }
     # Internal: entry point for the detached background refresh worker.
